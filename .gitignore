@@ -16,4 +16,4 @@ video/bench.txt
 video/exp_bench.txt
 video/preview/
 video/offline/
-video/*-OFFLINE.mp4
+video/*.mp4

@@ -6,12 +6,12 @@
 
 namespace grass {
 
-constexpr std::uint32_t kTargetBlades = 10000000u;
-constexpr std::uint32_t kBladesPerPatch = 100u;
-constexpr std::uint32_t kTallBladesPerPatch = 22u;
-constexpr int kPatchesX = 400;
-constexpr int kPatchesZ = 250;
-constexpr float kCell = 0.48f;
+constexpr std::uint32_t kTargetBlades = 60000000u;
+constexpr std::uint32_t kBladesPerPatch = 160u;
+constexpr std::uint32_t kTallBladesPerPatch = 36u;
+constexpr int kPatchesX = 750;
+constexpr int kPatchesZ = 500;
+constexpr float kCell = 0.252f;
 constexpr float kHalfX = 96.0f;
 constexpr float kHalfZ = 60.0f;
 constexpr float kTerrainHalfX = 102.0f;

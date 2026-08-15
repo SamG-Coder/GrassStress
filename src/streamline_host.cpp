@@ -14,6 +14,7 @@
 #endif
 
 #include <algorithm>
+#include <csetjmp>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -40,6 +41,33 @@ void appendLog(const char* line) {
         fputc('\n', f);
         fclose(f);
     }
+}
+
+thread_local jmp_buf g_ngxJmp;
+thread_local bool g_ngxGuard = false;
+
+LONG CALLBACK ngxVeh(EXCEPTION_POINTERS* info) {
+    if (!g_ngxGuard || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION) {
+        appendLog("trapped NGX access violation");
+        longjmp(g_ngxJmp, 1);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+template<class Fn>
+bool ngxTrap(Fn&& fn) {
+    static PVOID handle = AddVectoredExceptionHandler(1, ngxVeh);
+    (void)handle;
+    g_ngxGuard = true;
+    if (setjmp(g_ngxJmp) != 0) {
+        g_ngxGuard = false;
+        return false;
+    }
+    fn();
+    g_ngxGuard = false;
+    return true;
 }
 
 void logf(const char* fmt, int a = 0, int b = 0) {
@@ -258,11 +286,13 @@ struct StreamlineHost::Impl {
     }
     bool pGetU(NgxParameter* p, const char* n, unsigned int* v) {
         if (!p || !v) return false;
+        if (getUI && ngxOk(getUI(p, n, v))) return true;
         using Fn = unsigned int (*)(void*, const char*, unsigned int*);
         return ngxOk(reinterpret_cast<Fn>(vt(p)[12])(p, n, v));
     }
     bool pGetP(NgxParameter* p, const char* n, void** v) {
         if (!p || !v) return false;
+        if (getPtr && ngxOk(getPtr(p, n, v))) return true;
         using Fn = unsigned int (*)(void*, const char*, void**);
         return ngxOk(reinterpret_cast<Fn>(vt(p)[8])(p, n, v));
     }
@@ -338,8 +368,14 @@ bool StreamlineHost::startup(const wchar_t* pluginDirectory) {
     wchar_t dir[MAX_PATH]{};
     if (pluginDirectory) wcsncpy(dir, pluginDirectory, MAX_PATH - 1);
     wchar_t sl[MAX_PATH]{};
-    swprintf(sl, MAX_PATH, L"%s\\streamline", dir);
-    if (GetFileAttributesW(sl) != INVALID_FILE_ATTRIBUTES)
+    wcsncpy(sl, dir, MAX_PATH - 16);
+    wcscat(sl, L"\\streamline");
+    wchar_t exeDlss[MAX_PATH]{};
+    wcsncpy(exeDlss, dir, MAX_PATH - 20);
+    wcscat(exeDlss, L"\\nvngx_dlss.dll");
+    if (GetFileAttributesW(exeDlss) != INVALID_FILE_ATTRIBUTES)
+        wcsncpy(impl_->pluginDir, dir, MAX_PATH - 1);
+    else if (GetFileAttributesW(sl) != INVALID_FILE_ATTRIBUTES)
         wcsncpy(impl_->pluginDir, sl, MAX_PATH - 1);
     else
         wcsncpy(impl_->pluginDir, dir, MAX_PATH - 1);
@@ -353,8 +389,16 @@ bool StreamlineHost::startup(const wchar_t* pluginDirectory) {
     char narrow[MAX_PATH]{};
     WideCharToMultiByte(CP_UTF8, 0, ngx.c_str(), -1, narrow, MAX_PATH, nullptr, nullptr);
     appendLog(narrow);
-    impl_->module = LoadLibraryW(ngx.c_str());
-    if (!impl_->module) {
+    bool loaded = false;
+    if (!ngxTrap([&] {
+            impl_->module = LoadLibraryW(ngx.c_str());
+            loaded = impl_->module != nullptr;
+        })) {
+        appendLog("LoadLibrary _nvngx access violation");
+        impl_->module = nullptr;
+        return false;
+    }
+    if (!loaded) {
         logf("LoadLibrary _nvngx failed %d", static_cast<int>(GetLastError()));
         return false;
     }
@@ -379,14 +423,38 @@ bool StreamlineHost::setDevice(ID3D12Device* device) {
     impl_->common.PathListInfo.Path = impl_->pathList;
     impl_->common.PathListInfo.Length = 1;
     impl_->common.LoggingInfo.MinimumLoggingLevel = 1;
+    wchar_t dlssDll[MAX_PATH]{};
+    wcsncpy(dlssDll, impl_->pluginDir, MAX_PATH - 20);
+    wcscat(dlssDll, L"\\nvngx_dlss.dll");
+    char pluginNarrow[MAX_PATH]{};
+    WideCharToMultiByte(CP_UTF8, 0, impl_->pluginDir, -1, pluginNarrow, MAX_PATH, nullptr, nullptr);
+    appendLog(pluginNarrow);
+    appendLog(GetFileAttributesW(dlssDll) != INVALID_FILE_ATTRIBUTES
+                  ? "nvngx_dlss.dll present in plugin dir"
+                  : "nvngx_dlss.dll MISSING from plugin dir");
     const unsigned int ver = 0x0000015;
     unsigned int r = kNgxFail;
+    // Event Viewer: GrassStress 0xC0000005 in _nvngx.dll during Init.
+    // Trap it so the live path can keep running without DLSS.
     if (impl_->initSimple) {
-        r = impl_->initSimple(0x47525353ull, impl_->logDir, device, ver);
+        if (!ngxTrap([&] {
+                r = impl_->initSimple(0x47525353ull, impl_->logDir, device, ver);
+            })) {
+            appendLog("D3D12_Init access violation");
+            impl_->evalDead = true;
+            return false;
+        }
         logf("D3D12_Init 0x%08x", static_cast<int>(r));
     } else if (impl_->initProject) {
-        r = impl_->initProject("7c3e1d2a-5080-4b1e-9c77-10mgrasspt01", kNgxEngineCustom,
-                               "0.1.0", impl_->logDir, device, &impl_->common, ver);
+        if (!ngxTrap([&] {
+                r = impl_->initProject("7c3e1d2a-5080-4b1e-9c77-a10c6fa55b01",
+                                       kNgxEngineCustom, "0.1.0", impl_->logDir,
+                                       device, &impl_->common, ver);
+            })) {
+            appendLog("Init_ProjectID access violation");
+            impl_->evalDead = true;
+            return false;
+        }
         logf("Init_ProjectID 0x%08x", static_cast<int>(r));
     }
     if (!ngxOk(r)) return false;
@@ -397,10 +465,17 @@ bool StreamlineHost::setDevice(ID3D12Device* device) {
     }
     unsigned int available = 0;
     impl_->pGetU(impl_->caps, "SuperSampling.Available", &available);
+    if (!available) impl_->pGetU(impl_->caps, "#\x01", &available);
     logf("SuperSampling.Available %d", static_cast<int>(available));
+    unsigned int needDriver = 0, initResult = 0;
+    impl_->pGetU(impl_->caps, "SuperSampling.NeedsUpdatedDriver", &needDriver);
+    impl_->pGetU(impl_->caps, "SuperSampling.FeatureInitResult", &initResult);
+    logf("SS NeedDriver %d InitResult 0x%08x", static_cast<int>(needDriver),
+         static_cast<int>(initResult));
     status_.dlss = available != 0;
     unsigned int rr = 0;
     impl_->pGetU(impl_->caps, "RayReconstruction.Available", &rr);
+    if (!rr) impl_->pGetU(impl_->caps, "SuperSamplingDenoising.Available", &rr);
     status_.rayReconstruction = rr != 0;
     logf("RayReconstruction.Available %d", static_cast<int>(rr));
     if (impl_->getParams)
@@ -417,15 +492,23 @@ bool StreamlineHost::upgradeSwapChain(IDXGISwapChain**) { return false; }
 bool StreamlineHost::configure(std::uint32_t displayWidth, std::uint32_t displayHeight,
                                DlssQuality quality, FrameGenMode frameGen) {
     requestedQuality_ = quality;
-    requestedFrameGen_ = frameGen;
+    // Frame generation needs sl.interposer.dll beside the exe. On this MinGW
+    // host that DLL faults before wWinMain, so FG stays Off.
+    requestedFrameGen_ = FrameGenMode::Off;
+    (void)frameGen;
     status_.displayWidth = displayWidth;
     status_.displayHeight = displayHeight;
     status_.frameGen = FrameGenMode::Off;
+    status_.frameGeneration = false;
     status_.mfgMultiplier = 1;
     status_.presentedFrames = 1;
+    if (impl_->feature && impl_->releaseFeature) {
+        impl_->releaseFeature(impl_->feature);
+        impl_->feature = nullptr;
+    }
     impl_->created = false;
-    impl_->feature = nullptr;
     impl_->resetNext = true;
+    impl_->evalDead = false;
 
     if (quality == DlssQuality::Off) {
         impl_->applyFallback(status_, displayWidth, displayHeight, DlssQuality::Off);
@@ -510,6 +593,83 @@ void StreamlineHost::setCamera(const CameraBasis& current, const CameraBasis&, b
     if (reset) impl_->resetNext = true;
 }
 
+bool StreamlineHost::ensureFeature(ID3D12GraphicsCommandList* commands) {
+    if (!commands || impl_->evalDead) return false;
+    if (!impl_->inited || !impl_->createFeature || !impl_->eval) return false;
+    if (status_.quality == DlssQuality::Off) return false;
+    if (impl_->created && impl_->feature) return true;
+
+    impl_->pSetU(impl_->eval, "CreationNodeMask", 1);
+    impl_->pSetU(impl_->eval, "VisibilityNodeMask", 1);
+    impl_->pSetU(impl_->eval, "Width", status_.renderWidth);
+    impl_->pSetU(impl_->eval, "Height", status_.renderHeight);
+    impl_->pSetU(impl_->eval, "OutWidth", status_.displayWidth);
+    impl_->pSetU(impl_->eval, "OutHeight", status_.displayHeight);
+    impl_->pSetI(impl_->eval, "PerfQualityValue", toPerf(status_.quality));
+    const int flags = 1 /*HDR*/ | 2 /*MVLowRes*/ | 64 /*AutoExposure*/;
+    impl_->pSetI(impl_->eval, "DLSS.Feature.Create.Flags", flags);
+    impl_->pSetI(impl_->eval, "DLSS.Enable.Output.Subrects", 0);
+    impl_->pSetI(impl_->eval, "DLSS.Hint.Render.Preset.Quality", 11);
+    impl_->pSetI(impl_->eval, "DLSS.Hint.Render.Preset.Balanced", 11);
+    impl_->pSetI(impl_->eval, "DLSS.Hint.Render.Preset.Performance", 13);
+    if (impl_->getScratch) {
+        size_t bytes = 0;
+        impl_->getScratch(kNgxSuperSampling, impl_->eval, &bytes);
+        logf("scratch %d", static_cast<int>(bytes));
+        if (bytes && impl_->device && !impl_->scratch) {
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width = std::max<UINT64>(bytes, 256);
+            desc.Height = 1;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            impl_->device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                __uuidof(ID3D12Resource),
+                reinterpret_cast<void**>(&impl_->scratch));
+        }
+        if (impl_->scratch) {
+            impl_->pSetR(impl_->eval, "Scratch", impl_->scratch);
+            impl_->pSetULL(impl_->eval, "Scratch.SizeInBytes", bytes);
+        }
+    }
+    unsigned int id = kNgxSuperSampling;
+    unsigned int cr = kNgxFail;
+    if (!ngxTrap([&] {
+            cr = impl_->createFeature(commands, id, impl_->eval, &impl_->feature);
+        })) {
+        appendLog("CreateFeature access violation");
+        impl_->applyFallback(status_, status_.displayWidth, status_.displayHeight,
+                             requestedQuality_);
+        impl_->evalDead = true;
+        return false;
+    }
+    logf("CreateFeature 0x%08x", static_cast<int>(cr));
+    if (!ngxOk(cr) || !impl_->feature) {
+        impl_->applyFallback(status_, status_.displayWidth, status_.displayHeight,
+                             requestedQuality_);
+        impl_->evalDead = true;
+        return false;
+    }
+    impl_->created = true;
+    impl_->resetNext = true;
+    impl_->wantRr = false;
+    status_.taau = false;
+    status_.dlss = true;
+    status_.rayReconstruction = false;
+    char label[48]{};
+    std::snprintf(label, sizeof(label), "DLSS SR %s", qualityName(status_.quality));
+    writeLabel(status_.label, sizeof(status_.label), label);
+    appendLog(status_.label);
+    return true;
+}
+
 bool StreamlineHost::evaluateUpscale(ID3D12GraphicsCommandList* commands,
                                      ID3D12Resource* hdrColor,
                                      ID3D12Resource* linearDepth,
@@ -525,78 +685,7 @@ bool StreamlineHost::evaluateUpscale(ID3D12GraphicsCommandList* commands,
     if (!impl_->inited || !impl_->createFeature || !impl_->evaluate || !impl_->eval)
         return false;
     if (status_.quality == DlssQuality::Off) return false;
-    // Creating the NGX feature mid-frame on the DXR list AVs on this
-    // MinGW path. Skip until a feature already exists.
-    if (!impl_->created) return false;
-
-    if (!impl_->created) {
-        impl_->pSetU(impl_->eval, "CreationNodeMask", 1);
-        impl_->pSetU(impl_->eval, "VisibilityNodeMask", 1);
-        impl_->pSetU(impl_->eval, "Width", status_.renderWidth);
-        impl_->pSetU(impl_->eval, "Height", status_.renderHeight);
-        impl_->pSetU(impl_->eval, "OutWidth", status_.displayWidth);
-        impl_->pSetU(impl_->eval, "OutHeight", status_.displayHeight);
-        impl_->pSetI(impl_->eval, "PerfQualityValue", toPerf(status_.quality));
-        const int flags = 1 /*HDR*/ | 2 /*MVLowRes*/ | 64 /*AutoExposure*/;
-        impl_->pSetI(impl_->eval, "DLSS.Feature.Create.Flags", flags);
-        impl_->pSetI(impl_->eval, "DLSS.Enable.Output.Subrects", 0);
-        impl_->pSetI(impl_->eval, "DLSS.Hint.Render.Preset.Quality", 11);
-        impl_->pSetI(impl_->eval, "DLSS.Hint.Render.Preset.Balanced", 11);
-        impl_->pSetI(impl_->eval, "DLSS.Hint.Render.Preset.Performance", 13);
-        if (impl_->getScratch) {
-            size_t bytes = 0;
-            impl_->getScratch(kNgxSuperSampling, impl_->eval, &bytes);
-            logf("scratch %d", static_cast<int>(bytes));
-            if (bytes && impl_->device && !impl_->scratch) {
-                D3D12_HEAP_PROPERTIES heap{};
-                heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-                D3D12_RESOURCE_DESC desc{};
-                desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-                desc.Width = std::max<UINT64>(bytes, 256);
-                desc.Height = 1;
-                desc.DepthOrArraySize = 1;
-                desc.MipLevels = 1;
-                desc.SampleDesc.Count = 1;
-                desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-                desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-                impl_->device->CreateCommittedResource(
-                    &heap, D3D12_HEAP_FLAG_NONE, &desc,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-                    __uuidof(ID3D12Resource),
-                    reinterpret_cast<void**>(&impl_->scratch));
-            }
-            if (impl_->scratch) {
-                impl_->pSetR(impl_->eval, "Scratch", impl_->scratch);
-                impl_->pSetULL(impl_->eval, "Scratch.SizeInBytes", bytes);
-            }
-        }
-        unsigned int id = kNgxSuperSampling;
-        if (impl_->wantRr) {
-            impl_->pSetI(impl_->eval, "DLSS.Denoise.Mode", 1);
-            impl_->pSetU(impl_->eval, "DLSS.Roughness.Mode", 1);
-            impl_->pSetU(impl_->eval, "DLSS.Use.HW.Depth", 0);
-            id = kNgxRayReconstruction;
-        }
-        const unsigned int cr = impl_->createFeature(commands, id, impl_->eval, &impl_->feature);
-        logf("CreateFeature 0x%08x", static_cast<int>(cr));
-        if (!ngxOk(cr) || !impl_->feature) {
-            impl_->applyFallback(status_, status_.displayWidth, status_.displayHeight,
-                                 requestedQuality_);
-            impl_->evalDead = true;
-            return false;
-        }
-        impl_->created = true;
-        impl_->resetNext = true;
-        impl_->wantRr = (id == kNgxRayReconstruction);
-        status_.taau = false;
-        status_.dlss = !impl_->wantRr;
-        status_.rayReconstruction = impl_->wantRr;
-        char label[48]{};
-        std::snprintf(label, sizeof(label), "DLSS %s %s",
-                      impl_->wantRr ? "RR" : "SR", qualityName(status_.quality));
-        writeLabel(status_.label, sizeof(status_.label), label);
-        appendLog(status_.label);
-    }
+    if (!impl_->created || !impl_->feature) return false;
 
     impl_->pSetR(impl_->eval, "Color", hdrColor);
     impl_->pSetR(impl_->eval, "Output", outputColor);
@@ -605,11 +694,6 @@ bool StreamlineHost::evaluateUpscale(ID3D12GraphicsCommandList* commands,
     impl_->pSetR(impl_->eval, "TransparencyMask", nullptr);
     impl_->pSetR(impl_->eval, "ExposureTexture", nullptr);
     impl_->pSetR(impl_->eval, "DLSS.Input.Bias.Current.Color.Mask", nullptr);
-    {
-        void* check = nullptr;
-        impl_->pGetP(impl_->eval, "Color", &check);
-        logf("Color set %d", check == hdrColor ? 1 : 0);
-    }
     impl_->pSetF(impl_->eval, "Jitter.Offset.X", impl_->jitter[0]);
     impl_->pSetF(impl_->eval, "Jitter.Offset.Y", impl_->jitter[1]);
     impl_->pSetF(impl_->eval, "Sharpness", 0.0f);
@@ -638,7 +722,16 @@ bool StreamlineHost::evaluateUpscale(ID3D12GraphicsCommandList* commands,
         impl_->pSetR(impl_->eval, "GBuffer.Normals", normalRough);
         impl_->pSetR(impl_->eval, "GBuffer.Roughness", normalRough);
     }
-    const unsigned int er = impl_->evaluate(commands, impl_->feature, impl_->eval, nullptr);
+    unsigned int er = kNgxFail;
+    if (!ngxTrap([&] {
+            er = impl_->evaluate(commands, impl_->feature, impl_->eval, nullptr);
+        })) {
+        appendLog("EvaluateFeature access violation");
+        impl_->evalDead = true;
+        impl_->applyFallback(status_, status_.displayWidth, status_.displayHeight,
+                             requestedQuality_);
+        return false;
+    }
     if (!ngxOk(er)) {
         logf("EvaluateFeature 0x%08x", static_cast<int>(er));
         if (++impl_->evalFails >= 2) {

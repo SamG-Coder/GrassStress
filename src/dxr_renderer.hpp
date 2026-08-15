@@ -33,8 +33,8 @@ struct DebugRenderSettings {
     float bladeHeightScale = 1.00f;
     float groundNormalStrength = 1.00f;
     float groundDetailStrength = 1.00f;
-    float shortGrassDrawDistance = 26.0f;
-    float tallGrassDrawDistance = 52.0f;
+    float shortGrassDrawDistance = 3.402823466e+38f;
+    float tallGrassDrawDistance = 3.402823466e+38f;
 };
 
 struct HudState {
@@ -50,7 +50,7 @@ struct HudState {
     float powerW = 0.0f;
     float vramUsedGiB = 0.0f;
     float clockMHz = 0.0f;
-    std::uint32_t blades = 10000000;
+    std::uint32_t blades = 60000000;
     std::uint32_t patches = 0;
     float timeOfDay = 18.35f;
     bool cinematic = true;

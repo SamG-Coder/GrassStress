@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -67,10 +68,10 @@ public:
     bool moveForward=false,moveBackward=false,moveLeft=false,moveRight=false;
     bool sprint=false,jump=false;
     float pendingYaw=0,pendingPitch=0;
-    float yaw=.62f,pitch=.16f,distance=18.0f;
+    float yaw=.62f,pitch=.22f,distance=6.5f;
     POINT last{};
     dense::Vec3 grassWake{};
-    dense::Vec3 orbitTarget{0.0f,1.6f,0.0f};
+    dense::Vec3 orbitTarget{0.0f,0.35f,0.0f};
 
     float cinematicTime=0.0f;
     float titleAge=0.0f;
@@ -86,22 +87,28 @@ public:
     App()
         :firstPerson(makeWalkSettings(),
             [](float x,float z){return grass::sampleTerrain(x,z);}) {
-        field=grass::build(5080);
-        patchCount=static_cast<std::uint32_t>(field.grassPatches.size());
-        bladeCount=grass::countedBlades(field);
         debugSettings.grassDensity=1.0f;
         debugSettings.bladeHeightScale=1.22f;
-        debugSettings.shortGrassDrawDistance=28.0f;
-        debugSettings.tallGrassDrawDistance=48.0f;
-        environment.controls.advanceTime=false;
-        environment.state.timeOfDay=17.85f;
-        environment.controls.sunIntensityScale=1.68f;
-        environment.controls.windSpeed=2.85f;
-        environment.controls.windStrength=1.38f;
-        environment.controls.windGustFrequency=1.72f;
+        debugSettings.shortGrassDrawDistance=std::numeric_limits<float>::max();
+        debugSettings.tallGrassDrawDistance=std::numeric_limits<float>::max();
+        environment.controls.advanceTime=true;
+        environment.controls.dayLengthSeconds=40.0f;
+        environment.controls.timeScale=1.0f;
+        environment.state.timeOfDay=15.25f;
+        environment.controls.sunIntensityScale=2.15f;
+        environment.controls.moonIntensityScale=2.85f;
+        environment.controls.windSpeed=3.45f;
+        environment.controls.windStrength=1.72f;
+        environment.controls.windGustFrequency=1.95f;
         environment.controls.baseFogDensity=0.00078f;
         environment.update(0.0f);
         firstPerson.reset(-8.5f,14.0f,-.18f,-.06f);
+    }
+
+    void buildField() {
+        field=grass::build(5080);
+        patchCount=static_cast<std::uint32_t>(field.grassPatches.size());
+        bladeCount=grass::countedBlades(field);
     }
 
     static dense::FirstPersonCameraSettings makeWalkSettings() {
@@ -143,31 +150,21 @@ public:
 
     dense::CameraView cinematicView(float elapsed) {
         cinematicTime+=elapsed;
-        constexpr float loop=52.0f;
+        constexpr float loop=48.0f;
         if(cinematicTime>=loop)cinematicTime-=loop;
         const float t=cinematicTime;
-        dense::Vec3 eye,target;
-        if(t<10.0f) {
-            const float u=t/10.0f;
-            eye=smoothstepVec({-1.4f,.20f,8.6f},{.6f,.26f,3.1f},u);
-            target=smoothstepVec({1.8f,.38f,4.4f},{3.4f,.46f,-2.4f},u);
-        } else if(t<22.0f) {
-            const float u=(t-10.0f)/12.0f;
-            eye=smoothstepVec({.6f,.26f,3.1f},{-4.8f,1.58f,9.2f},u);
-            target=smoothstepVec({3.4f,.46f,-2.4f},{5.0f,.55f,-6.5f},u);
-        } else if(t<36.0f) {
-            const float u=(t-22.0f)/14.0f;
-            const float angle=.40f+u*1.85f;
-            const float radius=7.5f;
-            eye={std::sin(angle)*radius,1.55f,-std::cos(angle)*radius};
-            target={std::sin(angle+1.2f)*4.0f,.45f,-std::cos(angle+1.2f)*4.0f};
-        } else {
-            const float u=(t-36.0f)/16.0f;
-            eye=smoothstepVec({std::sin(2.25f)*7.5f,1.55f,-std::cos(2.25f)*7.5f},
-                              {-1.4f,.20f,8.6f},u);
-            target=smoothstepVec({2.2f,.45f,-3.0f},{1.8f,.38f,4.4f},u);
-        }
-        eye.y=std::max(eye.y,grass::terrainHeight(eye.x,eye.z)+.16f);
+        // Standing height over the meadow, looking into the blades. Low enough
+        // that ribbons stay visible; high enough that the frustum is not
+        // buried in the dirt.
+        const float yaw=t*.16f;
+        const float x=3.4f*std::sin(yaw)+.7f*std::sin(t*.12f);
+        const float z=4.2f*std::cos(yaw*.94f)+.5f*std::cos(t*.09f);
+        const float look=yaw+1.22f+.10f*std::sin(t*.23f);
+        const float reach=5.4f+.4f*std::sin(t*.14f);
+        const float tx=x+std::sin(look)*reach;
+        const float tz=z+std::cos(look)*reach;
+        dense::Vec3 eye{x,grass::terrainHeight(x,z)+1.82f,z};
+        dense::Vec3 target{tx,grass::terrainHeight(tx,tz)+.22f,tz};
         return {eye,dense::normalize(target-eye)};
     }
 
@@ -314,7 +311,7 @@ public:
         hud.displayFrameMs=hud.displayFps>0.05f?1000.0f/hud.displayFps:frameMs;
         hud.mfgMultiplier=stream.mfgMultiplier;
         hud.dlssMode=stream.rayReconstruction&&stream.quality!=dense::DlssQuality::Off?2u:
-                     ((stream.dlss||stream.taau)&&stream.quality!=dense::DlssQuality::Off?1u:0u);
+                     (stream.dlss&&stream.quality!=dense::DlssQuality::Off?1u:0u);
         hud.experiment=renderer.experiment();
         hud.choking=fps<20.0f||hud.frameMsP1>std::max(48.0f,hud.frameMs*2.2f);
         hud.blades=bladeCount;
@@ -343,7 +340,7 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
         FillRect(dc,&rc,static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
         SetBkMode(dc,TRANSPARENT);
         SetTextColor(dc,RGB(200,200,190));
-        DrawTextW(dc,L"Building 10,000,000 path-traced grass blades...",-1,&rc,
+        DrawTextW(dc,L"Building 60,000,000 path-traced grass blades...",-1,&rc,
                   DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         EndPaint(window,&ps);
         return 0;
@@ -352,7 +349,7 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
         PostQuitMessage(0);
         return 0;
     case WM_SIZE:
-        if(wParam!=SIZE_MINIMIZED)
+        if(wParam!=SIZE_MINIMIZED&&app->renderer.ready())
             app->renderer.resize(LOWORD(lParam),HIWORD(lParam));
         return 0;
     case WM_LBUTTONDOWN:
@@ -562,7 +559,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
         winY=std::max(0,(screenH-winH)/2);
     }
     HWND window=CreateWindowExW(0,windowClassName,
-        L"Building 10,000,000 path-traced grass blades...",
+        L"Building 60,000,000 path-traced grass blades...",
         style|WS_VISIBLE,winX,winY,winW,winH,nullptr,nullptr,instance,nullptr);
     if(!window){
         if(FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a")){fputs("create_window_failed\n",boot);fclose(boot);}
@@ -589,9 +586,12 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
     }
     app=owned.get();
     app->window=window;
-    app->gpu=dense::queryGpuCapabilities();
-    dense::initializeGpuTelemetry();
-    app->telemetry=dense::sampleGpuTelemetry();
+    if(FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a")){
+        fputs("skip_gpu_query\n",boot);fclose(boot);
+    }
+    app->gpu.adapter=L"NVIDIA";
+    app->gpu.directX12=true;
+    app->gpu.rayTracingTier=1;
 
     RAWINPUTDEVICE mouse{};
     mouse.usUsagePage=0x01;
@@ -601,15 +601,30 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
 
     RECT client{};
     GetClientRect(window,&client);
+    if(FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a")){
+        fprintf(boot,"initialize %d x %d\n",client.right,client.bottom);fclose(boot);
+    }
     if(!app->renderer.initialize(window,client.right,client.bottom)) {
         MessageBoxW(window,app->renderer.error(),L"Grass Stress DXR error",MB_ICONERROR);
         return 3;
     }
     app->renderer.setVsync(false);
     app->renderer.setExperiment(static_cast<std::uint32_t>(startExperiment));
-    SetWindowTextW(window,L"Building 10,000,000 path-traced grass blades...");
+    SetWindowTextW(window,L"Building 60,000,000 path-traced grass blades...");
     if(FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a")){
         fputs("building_grass\n",boot);fclose(boot);
+    }
+    {
+        MSG pump{};
+        while(PeekMessageW(&pump,nullptr,0,0,PM_REMOVE)) {
+            TranslateMessage(&pump);
+            DispatchMessageW(&pump);
+        }
+    }
+    app->buildField();
+    if(FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a")){
+        fprintf(boot,"field_ok blades %u patches %u\n",app->bladeCount,app->patchCount);
+        fclose(boot);
     }
     app->renderer.setWorld(std::move(app->field),
         [](float,float){return dense::PersistentWaterSample{};});

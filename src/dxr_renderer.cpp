@@ -377,7 +377,7 @@ std::vector<std::vector<uint32_t>> makeNormalMipChain(std::vector<uint32_t> top,
 }
 
 struct DxrRenderer::Impl{
-    HWND window{};int width=1,height=1,renderWidth=1,renderHeight=1;std::wstring lastError;bool initialized=false;UINT frameIndex=0;
+    HWND window{};int width=1,height=1,renderWidth=1,renderHeight=1;std::wstring lastError;bool initialized=false;bool deviceLost=false;UINT frameIndex=0;
     StreamlineHost sl;
     CameraBasis prevCamera{};bool havePrevCamera{};
     ID3D12Resource*linearDepth{};ID3D12Resource*motionVectors{};ID3D12Resource*normalRough{};
@@ -458,6 +458,8 @@ struct DxrRenderer::Impl{
     std::unordered_map<uint64_t,GrassChunk>grassChunkCache;
     uint64_t grassStreamEpoch{};
     std::vector<GrassPatchGpu>streamedGrassPatches;
+    std::vector<std::pair<float,UINT>>grassNearOrder;
+    std::vector<std::pair<float,UINT>>grassFarOrder;
     bool grassStreamValid{};
     WaterSampler waterSampler;
     bool customWorld{};
@@ -528,6 +530,20 @@ struct DxrRenderer::Impl{
         if(!execute())return false;
         ++submittedFrames;
         return true;
+    }
+    void createDlssFeature(){
+        if(sl.status().quality==DlssQuality::Off)return;
+        if(!begin())return;
+        const bool ok=sl.ensureFeature(list);
+        execute();
+        FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a");
+        if(boot){
+            const auto&st=sl.status();
+            fprintf(boot,"dlss_feature %d label %s %ux%u->%ux%u\n",
+                    ok?1:0,st.label,st.renderWidth,st.renderHeight,
+                    st.displayWidth,st.displayHeight);
+            fclose(boot);
+        }
     }
     ID3D12Resource*makeBuffer(UINT64 bytes,D3D12_HEAP_TYPE type,D3D12_RESOURCE_STATES state,D3D12_RESOURCE_FLAGS flags=D3D12_RESOURCE_FLAG_NONE){ID3D12Resource*r{};auto h=heap(type);auto d=bufferDesc(std::max<UINT64>(bytes,256),flags);if(FAILED(device->CreateCommittedResource(&h,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,__uuidof(ID3D12Resource),reinterpret_cast<void**>(&r))))return nullptr;return r;}
     template<class T>ID3D12Resource*upload(const std::vector<T>&data){ID3D12Resource*r=makeBuffer(data.size()*sizeof(T),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!r)return nullptr;void*mapped{};if(FAILED(r->Map(0,nullptr,&mapped))){release(r);return nullptr;}if(!data.empty())std::memcpy(mapped,data.data(),data.size()*sizeof(T));r->Unmap(0,nullptr);return r;}
@@ -694,54 +710,32 @@ struct DxrRenderer::Impl{
         if(!visibleGrassMapped)return {};
         auto*visible=static_cast<GrassPatchGpu*>(visibleGrassMapped);
         UINT nearCount=0,farCount=0;
-        const float shortDistance=clamp(settings.shortGrassDrawDistance,2.0f,128.0f);
-        const float tallDistance=std::max(shortDistance,
-            clamp(settings.tallGrassDrawDistance,4.0f,192.0f));
-        const float shortTransitionDistance=std::min(tallDistance,
-            std::max(shortDistance+12.0f,shortDistance*1.45f));
-        const float streamDeltaX=eye.x-grassStreamCenterX;
-        const float streamDeltaZ=eye.z-grassStreamCenterZ;
-        const float streamDelta=std::sqrt(streamDeltaX*streamDeltaX+
-                                          streamDeltaZ*streamDeltaZ);
-        if(!grassStreamValid||!std::isfinite(streamDelta)||
-           streamDelta>12.0f||grassStreamRadius<tallDistance+12.0f){
-            rebuildGrassStream(eye,tallDistance);
-        }
-        for(const GrassPatchGpu&patch:streamedGrassPatches){
-            const bool tall=((patch.packed>>16)&255u)!=0;
-            const float drawDistance=tall?tallDistance:shortTransitionDistance;
+        if(!grassStreamValid)
+            rebuildGrassStream(eye,std::numeric_limits<float>::max());
+        grassNearOrder.clear();
+        grassFarOrder.clear();
+        if(grassPatchCount==0)return {};
+        const UINT patchTotal=static_cast<UINT>(streamedGrassPatches.size());
+        for(UINT index=0;index<patchTotal;++index){
+            const GrassPatchGpu&patch=streamedGrassPatches[index];
             const Vec3 center{(patch.minX+patch.maxX)*.5f,patch.baseY,
                               (patch.minZ+patch.maxZ)*.5f};
             const Vec3 delta=center-eye;
-            if(dot(delta,delta)>=drawDistance*drawDistance)continue;
             const float radiusX=(patch.maxX-patch.minX)*.5f;
             const float radiusY=std::max(patch.maxY-patch.baseY,
                                          patch.baseY-patch.minY);
             const float radiusZ=(patch.maxZ-patch.minZ)*.5f;
-            // Grass interaction can displace a tall blade beyond its authored
-            // patch AABB. Include that maximum bend in the frustum sphere so
-            // walking/look direction cannot cull the displaced ribbon at a
-            // screen edge and appear to add or remove a whole patch.
             const float interactionCullMargin=2.25f*
                 clamp(settings.bladeHeightScale,.35f,2.5f);
             const float radius=std::sqrt(radiusX*radiusX+radiusY*radiusY+
                                          radiusZ*radiusZ)+interactionCullMargin;
             const float viewDepth=dot(delta,forward);
-            if(viewDepth+radius<=.02f)continue;
+            if(viewDepth+radius<=-1.25f)continue;
             const float projectedDepth=std::max(viewDepth,.02f);
             if(std::abs(dot(delta,right))>projectedDepth*tanHalf*aspect+radius)continue;
             if(std::abs(dot(delta,up))>projectedDepth*tanHalf+radius)continue;
-            // Keep the full near-instance stride through the short-blade
-            // crossfade. At its outer edge only the deterministic tall prefix
-            // remains, so switching to the cheaper far stride cannot pop an
-            // entire ring of short blades while the player walks.
-            if(dot(delta,delta)<shortTransitionDistance*shortTransitionDistance){
-                if(nearCount>=2800u)continue;
-                visible[nearCount++]=patch;
-            }else if(tall){
-                if(farCount>=1400u)continue;
-                visible[grassPatchCount-1u-farCount++]=patch;
-            }
+            if(nearCount>=grassPatchCount)break;
+            visible[nearCount++]=patch;
         }
         return {nearCount,farCount};
     }
@@ -1683,7 +1677,7 @@ struct DxrRenderer::Impl{
         std::vector<GrassBladeGpu> packedBlades=environment.grassBlades;
         grassBlasChunks.clear();
         if(!packedBlades.empty()){
-            constexpr int cellsX=20,cellsZ=13;
+            constexpr int cellsX=30,cellsZ=20;
             const float originX=-96.0f,originZ=-60.0f;
             const float cellW=192.0f/cellsX,cellH=120.0f/cellsZ;
             std::vector<std::vector<GrassBladeGpu>> bins(
@@ -1842,21 +1836,46 @@ struct DxrRenderer::Impl{
 
 DxrRenderer::DxrRenderer():impl_(std::make_unique<Impl>()){}DxrRenderer::~DxrRenderer()=default;
 bool DxrRenderer::initialize(HWND window,int width,int height){auto&i=*impl_;i.window=window;i.width=std::max(1,width);i.height=std::max(1,height);i.renderWidth=i.width;i.renderHeight=i.height;
-    wchar_t exePath[MAX_PATH]{};GetModuleFileNameW(nullptr,exePath,MAX_PATH);
-    const std::filesystem::path pluginDir=std::filesystem::path(exePath).parent_path();
-    {
-        CreateDirectoryW(L"C:\\StressTest\\video",nullptr);
-        FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","w");
-        if(boot){fputs("starting\n",boot);fclose(boot);}
-    }
-    const bool slStarted=i.sl.startup(pluginDir.c_str());
+    CreateDirectoryW(L"C:\\StressTest\\video",nullptr);
     {
         FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a");
-        if(boot){fprintf(boot,"streamline_startup %d\n",slStarted?1:0);fclose(boot);}
+        if(boot){fputs("starting\n",boot);fclose(boot);}
+    }
+    wchar_t exePath[MAX_PATH]{};GetModuleFileNameW(nullptr,exePath,MAX_PATH);
+    if(wchar_t*slash=wcsrchr(exePath,L'\\'))*slash=0;
+    {
+        FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a");
+        if(boot){fputs("create_factory\n",boot);fclose(boot);}
     }
     HRESULT hr=CreateDXGIFactory1(__uuidof(IDXGIFactory6),reinterpret_cast<void**>(&i.factory));if(FAILED(hr))return i.fail(hr,L"DXGI factory creation failed");
-    IDXGIAdapter1*adapter{};for(UINT n=0;i.factory->EnumAdapterByGpuPreference(n,DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,__uuidof(IDXGIAdapter1),reinterpret_cast<void**>(&adapter))!=DXGI_ERROR_NOT_FOUND;++n){DXGI_ADAPTER_DESC1 d{};adapter->GetDesc1(&d);if(!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)&&SUCCEEDED(D3D12CreateDevice(adapter,D3D_FEATURE_LEVEL_12_1,__uuidof(ID3D12Device5),reinterpret_cast<void**>(&i.device))))break;release(adapter);}release(adapter);if(!i.device){i.lastError=L"No DXR-capable DirectX 12 device was found.";return false;}
-    i.sl.setDevice(i.device);D3D12_FEATURE_DATA_D3D12_OPTIONS5 options{};if(FAILED(i.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5,&options,sizeof(options)))||options.RaytracingTier<D3D12_RAYTRACING_TIER_1_1){i.lastError=L"The selected GPU does not expose DXR 1.1 inline ray queries.";return false;}
+    {
+        FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a");
+        if(boot){fputs("create_device\n",boot);fclose(boot);}
+    }
+    IDXGIAdapter1*adapter{};
+    for(UINT n=0;i.factory->EnumAdapterByGpuPreference(n,DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,__uuidof(IDXGIAdapter1),reinterpret_cast<void**>(&adapter))!=DXGI_ERROR_NOT_FOUND;++n){
+        DXGI_ADAPTER_DESC1 d{};adapter->GetDesc1(&d);
+        if(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE){release(adapter);continue;}
+        HRESULT deviceHr=E_FAIL;
+        for(int attempt=0;attempt<4&&!i.device;++attempt){
+            if(attempt)Sleep(400);
+            deviceHr=D3D12CreateDevice(adapter,D3D_FEATURE_LEVEL_12_1,__uuidof(ID3D12Device5),reinterpret_cast<void**>(&i.device));
+            FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a");
+            if(boot){fprintf(boot,"create_device_try %u %d hr 0x%08X\n",n,attempt,static_cast<unsigned>(deviceHr));fclose(boot);}
+            MSG pump{};
+            while(PeekMessageW(&pump,nullptr,0,0,PM_REMOVE)){
+                TranslateMessage(&pump);DispatchMessageW(&pump);
+            }
+        }
+        if(i.device){release(adapter);break;}
+        release(adapter);
+    }
+    if(!i.device){i.lastError=L"No DXR-capable DirectX 12 device was found.";return false;}
+    {
+        FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a");
+        if(boot){fputs("device_ok\n",boot);fclose(boot);}
+    }
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options{};if(FAILED(i.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5,&options,sizeof(options)))||options.RaytracingTier<D3D12_RAYTRACING_TIER_1_1){i.lastError=L"The selected GPU does not expose DXR 1.1 inline ray queries.";return false;}
     D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;hr=i.device->CreateCommandQueue(&q,__uuidof(ID3D12CommandQueue),reinterpret_cast<void**>(&i.queue));if(FAILED(hr))return i.fail(hr,L"DXR command queue creation failed");
     for(UINT slot=0;slot<2;++slot){
         hr=i.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,__uuidof(ID3D12CommandAllocator),reinterpret_cast<void**>(&i.allocators[slot]));
@@ -1880,6 +1899,13 @@ bool DxrRenderer::initialize(HWND window,int width,int height){auto&i=*impl_;i.w
     {
         FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a");
         if(boot){fputs("copy_queue_ready\n",boot);fclose(boot);}
+    }
+    // Load NGX only after a live D3D12 device and queue exist. Event Viewer
+    // showed 0xC0000005 in _nvngx.dll when it was loaded before device create.
+    const bool slStarted=i.sl.startup(exePath);
+    {
+        FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a");
+        if(boot){fprintf(boot,"streamline_startup %d\n",slStarted?1:0);fclose(boot);}
     }
     i.sl.setDevice(i.device);
     i.sl.configure(static_cast<std::uint32_t>(i.width),static_cast<std::uint32_t>(i.height),
@@ -1910,8 +1936,49 @@ bool DxrRenderer::initialize(HWND window,int width,int height){auto&i=*impl_;i.w
     }else{
         i.renderWidth=i.width;i.renderHeight=i.height;
     }
-    if(!i.createBackBuffers()||!i.createOutputs()||!i.createBarkNormal()||!i.createGroundMaterials()||!i.createPipeline()||!i.createGrassPipeline()||!i.createHudPipeline()||!i.createPresentPipeline()||!i.createDenoisePipeline()||!i.createTreeWindPipeline())return false;i.cameraBuffer=i.makeBuffer(512,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);i.environmentBuffer=i.makeBuffer(512,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);i.hudBuffer=i.makeBuffer(512,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);i.presentBuffer=i.makeBuffer(512,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);i.denoiseCb=i.makeBuffer(512,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!i.cameraBuffer||!i.environmentBuffer||!i.hudBuffer||!i.presentBuffer||!i.denoiseCb||FAILED(i.cameraBuffer->Map(0,nullptr,&i.cameraMappedBase))||FAILED(i.environmentBuffer->Map(0,nullptr,&i.environmentMappedBase))||FAILED(i.hudBuffer->Map(0,nullptr,&i.hudMappedBase))||FAILED(i.presentBuffer->Map(0,nullptr,&i.presentMappedBase))||FAILED(i.denoiseCb->Map(0,nullptr,&i.denoiseCbMappedBase)))return false;i.cameraMapped=i.cameraMappedBase;i.environmentMapped=i.environmentMappedBase;i.hudMapped=i.hudMappedBase;i.presentMapped=i.presentMappedBase;i.denoiseCbMapped=i.denoiseCbMappedBase;i.bindInFlight(0);i.initialized=true;return true;}
-void DxrRenderer::resize(int width,int height){auto&i=*impl_;if(!i.initialized||width<=0||height<=0)return;if(width==i.width&&height==i.height)return;i.wait();i.width=width;i.height=height;for(auto&b:i.backBuffers)release(b);if(SUCCEEDED(i.swap->ResizeBuffers(0,width,height,DXGI_FORMAT_UNKNOWN,0))){i.createBackBuffers();i.sl.configure(static_cast<std::uint32_t>(i.width),static_cast<std::uint32_t>(i.height),i.sl.quality(),i.sl.frameGen());if(i.sl.upscaleActive()&&i.sl.status().renderWidth&&i.sl.status().renderHeight){i.renderWidth=static_cast<int>(i.sl.status().renderWidth);i.renderHeight=static_cast<int>(i.sl.status().renderHeight);}else{i.renderWidth=i.width;i.renderHeight=i.height;}i.createOutputs();}}
+    auto bootMark=[&](const char*m){
+        FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a");
+        if(boot){fputs(m,boot);fputc('\n',boot);fclose(boot);}
+    };
+    bootMark("create_backbuffers");
+    if(!i.createBackBuffers())return false;
+    bootMark("create_outputs");
+    if(!i.createOutputs())return false;
+    bootMark("create_bark");
+    if(!i.createBarkNormal())return false;
+    bootMark("create_ground");
+    if(!i.createGroundMaterials())return false;
+    bootMark("create_pipeline");
+    if(!i.createPipeline())return false;
+    bootMark("create_grass");
+    if(!i.createGrassPipeline())return false;
+    bootMark("create_hud");
+    if(!i.createHudPipeline())return false;
+    bootMark("create_present");
+    if(!i.createPresentPipeline())return false;
+    bootMark("create_wind");
+    if(!i.createTreeWindPipeline())return false;
+    i.cameraBuffer=i.makeBuffer(512,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    i.environmentBuffer=i.makeBuffer(512,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    i.hudBuffer=i.makeBuffer(512,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    i.presentBuffer=i.makeBuffer(512,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    i.denoiseCb=i.makeBuffer(512,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    if(!i.cameraBuffer||!i.environmentBuffer||!i.hudBuffer||!i.presentBuffer||!i.denoiseCb||
+       FAILED(i.cameraBuffer->Map(0,nullptr,&i.cameraMappedBase))||
+       FAILED(i.environmentBuffer->Map(0,nullptr,&i.environmentMappedBase))||
+       FAILED(i.hudBuffer->Map(0,nullptr,&i.hudMappedBase))||
+       FAILED(i.presentBuffer->Map(0,nullptr,&i.presentMappedBase))||
+       FAILED(i.denoiseCb->Map(0,nullptr,&i.denoiseCbMappedBase)))return false;
+    i.cameraMapped=i.cameraMappedBase;i.environmentMapped=i.environmentMappedBase;
+    i.hudMapped=i.hudMappedBase;i.presentMapped=i.presentMappedBase;
+    i.denoiseCbMapped=i.denoiseCbMappedBase;i.bindInFlight(0);
+    bootMark("create_dlss");
+    i.createDlssFeature();
+    i.initialized=true;
+    bootMark("initialize_ok");
+    return true;
+}
+void DxrRenderer::resize(int width,int height){auto&i=*impl_;if(!i.initialized||i.deviceLost||width<=0||height<=0)return;if(width==i.width&&height==i.height)return;i.wait();i.width=width;i.height=height;for(auto&b:i.backBuffers)release(b);if(SUCCEEDED(i.swap->ResizeBuffers(0,width,height,DXGI_FORMAT_UNKNOWN,0))){i.createBackBuffers();i.sl.configure(static_cast<std::uint32_t>(i.width),static_cast<std::uint32_t>(i.height),i.sl.quality(),i.sl.frameGen());if(i.sl.upscaleActive()&&i.sl.status().renderWidth&&i.sl.status().renderHeight){i.renderWidth=static_cast<int>(i.sl.status().renderWidth);i.renderHeight=static_cast<int>(i.sl.status().renderHeight);}else{i.renderWidth=i.width;i.renderHeight=i.height;}i.createOutputs();i.createDlssFeature();}}
 void DxrRenderer::setTree(std::shared_ptr<const TreeMesh>tree){
     if(!tree)tree=std::make_shared<TreeMesh>();
     impl_->sourceTree=std::move(tree);
@@ -2107,7 +2174,7 @@ void DxrRenderer::render(const CameraView&requestedView,
                          const DebugRenderSettings&settings,
                          const EnvironmentCB&environment,
                          const PlayerLocalLight&requestedLocalLight){
-    auto&i=*impl_;if(!i.initialized||!i.tlas)return;
+    auto&i=*impl_;if(!i.initialized||i.deviceLost||!i.tlas)return;
     if(i.submittedFrames<4){
         FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a");
         if(boot){fprintf(boot,"render_begin %u tlas %p cam %p\n",
@@ -2194,7 +2261,12 @@ void DxrRenderer::render(const CameraView&requestedView,
     const bool environmentChanged=!i.haveLastEnvironment||
         std::memcmp(&visualEnvironment,&previousVisualEnvironment,
                     sizeof(visualEnvironment))!=0;
-    if(viewChanged||localLightChanged||debugChanged||environmentChanged){
+    const bool useDlss=i.sl.upscaleActive();
+    const bool hardCut=!i.haveLastView||
+        lengthSq(eye-i.lastView.eye)>9.0f;
+    // Cinematic motion and wind must not zero the temporal index. That forced
+    // DLSS Reset every frame and left the 1-spp path tracer raw-noisy.
+    if(!useDlss&&(hardCut||localLightChanged||debugChanged||environmentChanged)){
         i.frameIndex=0;
     }
     i.lastView=view;i.lastLocalLight=localLight;
@@ -2204,17 +2276,15 @@ void DxrRenderer::render(const CameraView&requestedView,
     const bool animatedEnvironment=environment.windSpeed>.001f||
         environment.rainIntensity>.001f||environment.lightningFlash>.001f||
         environmentChanged;
-    const bool useDlss=i.sl.upscaleActive();
     const UINT temporalFrames=i.offlineSpp?i.offlineSpp:(useDlss?1u:(animatedEnvironment?1u:8u));
     const UINT shaderFrame=temporalFrames>1u?i.frameIndex:0u;
     const float tanHalf=std::tan(52*pi/360);
     const float grassDensity=clamp(settings.grassDensity,0.0f,6.0f);
     const UINT packedBlades=i.environment.grassPatches.empty()?80u:
-        std::min<UINT>(i.environment.grassPatches.front().packed&255u,128u);
+        std::min<UINT>(i.environment.grassPatches.front().packed&255u,160u);
     const UINT nearGrassStride=static_cast<UINT>(clamp(
-        std::ceil(std::max(1.0f,grassDensity)*static_cast<float>(packedBlades)),1.0f,128.0f));
-    const UINT farGrassStride=static_cast<UINT>(clamp(
-        std::ceil(std::min(std::max(grassDensity,1.0f),1.0f)*22.0f),1.0f,44.0f));
+        std::ceil(std::max(1.0f,grassDensity)*static_cast<float>(packedBlades)),1.0f,160.0f));
+    const UINT farGrassStride=0;
     const float renderAspect=static_cast<float>(i.renderWidth)/
         static_cast<float>(std::max(1,i.renderHeight));
     i.recycleInFlight();
@@ -2235,7 +2305,7 @@ void DxrRenderer::render(const CameraView&requestedView,
     currentCamera.jitter[0]=jitterX;currentCamera.jitter[1]=jitterY;
     currentCamera.time=environment.time;
     const CameraBasis prevCamera=i.havePrevCamera?i.prevCamera:currentCamera;
-    const bool resetHistory=!i.havePrevCamera||i.frameIndex==0;
+    const bool resetHistory=hardCut||!i.havePrevCamera;
     i.sl.markerSimulationEnd();
     i.sl.setCamera(currentCamera,prevCamera,resetHistory);
     i.sl.markerRenderStart();
@@ -2404,80 +2474,9 @@ void DxrRenderer::render(const CameraView&requestedView,
 
     ID3D12Resource*ptHdr=i.output;
     i.lastHdr=i.output;
-    if(i.experiment>=3u&&i.denoisePipeline&&i.denoiseRoot&&i.denoisePing&&i.denoiseCbMapped){
-        struct DenoiseConstants{
-            UINT size[2];UINT step;UINT experiment;
-            float eye[3];float tanHalf;
-            float forward[3];float aspect;
-            float right[3];UINT frame;
-            float up[3];float pad;
-        };
-        D3D12_SHADER_RESOURCE_VIEW_DESC colorView{};
-        colorView.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        colorView.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
-        colorView.Texture2D.MipLevels=1;
-        colorView.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
-        i.list->SetComputeRootSignature(i.denoiseRoot);
-        i.list->SetPipelineState(i.denoisePipeline);
-        D3D12_GPU_DESCRIPTOR_HANDLE srv=i.gpuHeap->GetGPUDescriptorHandleForHeapStart();
-        srv.ptr+=12ull*i.srvSize;
-        const UINT steps[3]={1u,2u,4u};
-        const int passCount=(i.experiment>=3u&&i.experiment<=6u)?1:3;
-        ID3D12Resource*src=i.output;
-        ID3D12Resource*dst=i.denoisePing;
-        D3D12_RESOURCE_STATES srcState=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        D3D12_RESOURCE_STATES dstState=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        for(int pass=0;pass<passCount;++pass){
-            DenoiseConstants dc{};
-            dc.size[0]=static_cast<UINT>(i.renderWidth);
-            dc.size[1]=static_cast<UINT>(i.renderHeight);
-            dc.step=steps[pass];
-            dc.experiment=i.experiment;
-            dc.eye[0]=eye.x;dc.eye[1]=eye.y;dc.eye[2]=eye.z;
-            dc.tanHalf=tanHalf;
-            dc.forward[0]=forward.x;dc.forward[1]=forward.y;dc.forward[2]=forward.z;
-            dc.aspect=renderAspect;
-            dc.right[0]=right.x;dc.right[1]=right.y;dc.right[2]=right.z;
-            dc.frame=shaderFrame;
-            dc.up[0]=up.x;dc.up[1]=up.y;dc.up[2]=up.z;
-            std::memcpy(i.denoiseCbMapped,&dc,sizeof(dc));
-            i.device->CreateShaderResourceView(src,&colorView,i.heapCpu(12));
-            const UINT uavIndex=(dst==i.denoisePing)?15u:0u;
-            D3D12_GPU_DESCRIPTOR_HANDLE uav=i.gpuHeap->GetGPUDescriptorHandleForHeapStart();
-            uav.ptr+=static_cast<SIZE_T>(uavIndex)*i.srvSize;
-            i.list->SetComputeRootDescriptorTable(0,srv);
-            i.list->SetComputeRootDescriptorTable(1,uav);
-            i.list->SetComputeRootConstantBufferView(2,i.denoiseGpu?i.denoiseGpu:i.denoiseCb->GetGPUVirtualAddress());
-            i.list->Dispatch((i.renderWidth+7)/8,(i.renderHeight+7)/8,1);
-            const bool lastPass=pass==passCount-1;
-            D3D12_RESOURCE_BARRIER afterPass[]={
-                transition(dst,dstState,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                transition(src,srcState,D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-            };
-            i.list->ResourceBarrier(lastPass?1:2,afterPass);
-            srcState=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            dstState=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            if(!lastPass){
-                ID3D12Resource*swap=src;src=dst;dst=swap;
-            }
-        }
-        const bool showExperiment=i.experiment>=3u;
-        if(showExperiment){
-            ptHdr=i.denoisePing;
-            i.lastHdr=i.denoisePing;
-        }else{
-            ptHdr=i.output;
-            i.lastHdr=i.output;
-            auto pingReset=transition(i.denoisePing,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            i.list->ResourceBarrier(1,&pingReset);
-        }
-    }
 
     ID3D12Resource*displayHdr=ptHdr;
     D3D12_RESOURCE_STATES displayHdrState=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    if(displayHdr==i.denoisePing)
-        displayHdrState=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     i.upscaleThisFrame=false;
     if(useDlss && i.sl.status().dlss){
         i.upscaleThisFrame=i.sl.evaluateUpscale(
@@ -2520,7 +2519,7 @@ void DxrRenderer::render(const CameraView&requestedView,
     if(i.presentPipeline&&i.presentRoot&&i.presentMapped){
         struct PresentConstants{float resolution[2];float grain;float pad;}presentConstants{
             {static_cast<float>(i.width),static_cast<float>(i.height)},
-            static_cast<float>(i.frameIndex),0};
+            static_cast<float>(i.frameIndex),i.upscaleThisFrame?1.0f:0.0f};
         std::memcpy(i.presentMapped,&presentConstants,sizeof(presentConstants));
         i.list->SetGraphicsRootSignature(i.presentRoot);
         i.list->SetPipelineState(i.presentPipeline);
@@ -2604,10 +2603,6 @@ void DxrRenderer::render(const CameraView&requestedView,
         auto resetDlss=transition(i.dlssOutput,displayHdrState,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         i.list->ResourceBarrier(1,&resetDlss);
     }
-    if(displayHdr==i.denoisePing){
-        auto resetPing=transition(i.denoisePing,displayHdrState,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        i.list->ResourceBarrier(1,&resetPing);
-    }
     i.sl.markerRenderEnd();
     if(i.executeAsync()){
         i.sl.markerPresentStart();
@@ -2623,8 +2618,18 @@ void DxrRenderer::render(const CameraView&requestedView,
                              i.submittedFrames,static_cast<unsigned>(presentHr));fclose(boot);}
         }
         if(FAILED(presentHr)){
+            HRESULT reason=i.device->GetDeviceRemovedReason();
+            FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a");
+            if(boot){fprintf(boot,"device_removed present=0x%08X reason=0x%08X\n",
+                             static_cast<unsigned>(presentHr),
+                             static_cast<unsigned>(reason));fclose(boot);}
             i.lastError=L"Present failed (device removed).";
+            i.deviceLost=true;
             return;
+        }
+        if((i.submittedFrames%30u)==0u){
+            FILE*boot=fopen("C:\\StressTest\\video\\boot.txt","a");
+            if(boot){fprintf(boot,"render_ok %u\n",i.submittedFrames);fclose(boot);}
         }
     }
 }
@@ -2650,6 +2655,7 @@ void DxrRenderer::setDlssQuality(DlssQuality quality){
         i.renderWidth=i.width;i.renderHeight=i.height;
     }
     i.createOutputs();
+    i.createDlssFeature();
 }
 
 void DxrRenderer::setExperiment(std::uint32_t index){
@@ -2888,7 +2894,7 @@ void DxrRenderer::render(float yaw,float pitch,float distance,
     render(CameraView{eye,normalize(target-eye)},settings,environment,PlayerLocalLight{});
 }
 
-const wchar_t*DxrRenderer::error()const{return impl_->lastError.c_str();}bool DxrRenderer::ready()const{return impl_->initialized;}
+const wchar_t*DxrRenderer::error()const{return impl_->lastError.c_str();}bool DxrRenderer::ready()const{return impl_->initialized&&!impl_->deviceLost;}
 std::uint32_t DxrRenderer::pathTracedBladeCount()const{return impl_->grassBladeCount;}
 std::uint32_t DxrRenderer::visibleNearPatches()const{return impl_->visibleNearGrassPatchCount;}
 std::uint32_t DxrRenderer::visibleFarPatches()const{return impl_->visibleFarGrassPatchCount;}

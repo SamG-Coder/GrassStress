@@ -61,10 +61,10 @@ void emitPathTracedBlades(dense::EnvironmentMesh& mesh) {
         for(std::uint32_t bladeIndex=0;bladeIndex<bladeCount;++bladeIndex) {
             const std::uint32_t seed=hashUint(patchRandomSeed^((bladeIndex+1u)*0x9e3779b9u));
             const float tall=bladeIndex<tallCount?1.0f:0.0f;
-            const float radius=std::sqrt(randomUint(seed))* (tall>.5f?.065f:.245f);
+            const float radius=std::sqrt(randomUint(seed))*(tall>.5f?.055f:.20f);
             const float offsetAngle=randomUint(seed^0x68bc21ebu)*6.2831853f;
             const float clusterAngle=randomUint(patchRandomSeed^0x91e10da5u)*6.2831853f;
-            const float clusterRadius=randomUint(patchRandomSeed^0x243f6a88u)*.095f*tall;
+            const float clusterRadius=randomUint(patchRandomSeed^0x243f6a88u)*.052f*tall;
             const dense::Vec3 base=center
                 +axisX*(std::cos(offsetAngle)*radius+std::cos(clusterAngle)*clusterRadius)
                 +axisZ*(std::sin(offsetAngle)*radius+std::sin(clusterAngle)*clusterRadius);
@@ -168,8 +168,13 @@ dense::EnvironmentMesh build(std::uint32_t seed) {
     constexpr float heightCodeStep=.004f;
     for(int iz=0;iz<kPatchesZ;++iz) {
         for(int ix=0;ix<kPatchesX;++ix) {
-            const float x=-kHalfX+(static_cast<float>(ix)+rng.range(.12f,.88f))*kCell;
-            const float z=-kHalfZ+(static_cast<float>(iz)+rng.range(.12f,.88f))*kCell;
+            const float hex=(iz&1)?0.5f:0.0f;
+            const float swirlX=(fbm(static_cast<float>(ix)*.17f,static_cast<float>(iz)*.19f)-.5f)*.62f;
+            const float swirlZ=(fbm(static_cast<float>(ix)*.21f+3.1f,static_cast<float>(iz)*.13f)-.5f)*.62f;
+            const float x=dense::clamp(-kHalfX+(static_cast<float>(ix)+hex+
+                rng.range(-.46f,.46f)+swirlX)*kCell,-kHalfX+.15f,kHalfX-.15f);
+            const float z=dense::clamp(-kHalfZ+(static_cast<float>(iz)+
+                rng.range(-.46f,.46f)+swirlZ)*kCell,-kHalfZ+.15f,kHalfZ-.15f);
             const auto surface=sampleTerrain(x,z);
             const dense::Vec3 normal=surface.normal;
 
@@ -180,8 +185,8 @@ dense::EnvironmentMesh build(std::uint32_t seed) {
             const float moisture=dense::clamp(.56f+(fertility-.5f)*.42f-
                                               dryColony*.18f+rng.range(-.02f,.02f),0.0f,1.0f);
 
-            const float shortHeight=rng.range(.22f,.36f);
-            const float tallHeight=rng.range(.48f,.74f);
+            const float shortHeight=rng.range(.26f,.42f);
+            const float tallHeight=rng.range(.55f,.86f);
             const std::uint32_t shortCode=static_cast<std::uint32_t>(
                 dense::clamp(shortHeight/heightCodeStep,1.0f,255.0f));
             const std::uint32_t tallCode=static_cast<std::uint32_t>(
@@ -193,7 +198,7 @@ dense::EnvironmentMesh build(std::uint32_t seed) {
             const float slope=std::sqrt(normal.x*normal.x+normal.z*normal.z)/
                               std::max(normal.y,.25f);
             constexpr float safety=.04f;
-            const float horizontalReach=.28f+maxHeight*(slope+.72f)+.02f+safety;
+            const float horizontalReach=.18f+maxHeight*(slope+.55f)+.02f+safety;
             const float surfaceRise=.28f*slope;
             const float lowerReach=surfaceRise+.02f*slope+safety;
             const float upperReach=surfaceRise+maxHeight*(normal.y+.72f*slope)+safety;

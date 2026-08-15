@@ -72,12 +72,14 @@ float3 sampleCatmull(float2 uv) {
 }
 
 float4 PSMain(VSOut input) : SV_Target {
-    float3 hdr = sampleCatmull(input.uv);
+    // DLSS already reconstructed the display image. Catmull-Rom on top of
+    // that just blurs the transformer output.
+    float3 hdr = g_Pad > 0.5
+        ? HdrColor.SampleLevel(LinearClamp, input.uv, 0).rgb
+        : sampleCatmull(input.uv);
     float3 graded = colorGrade(tonemap(hdr * 1.28));
     float2 nv = input.uv * 2 - 1;
     float vignette = saturate(1.22 - dot(nv, nv) * .20);
     graded *= vignette;
-    float grain = hash(input.uv * g_Resolution + g_GrainSeed) * .035 - .012;
-    graded = saturate(graded + grain);
     return float4(linearToSrgb(graded), 1);
 }

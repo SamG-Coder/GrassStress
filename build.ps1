@@ -60,9 +60,16 @@ if (Test-Path $slBin) {
 }
 foreach ($dll in @(
     'sl.interposer.dll','sl.common.dll','sl.dlss.dll','sl.dlss_d.dll','sl.dlss_g.dll',
-    'sl.reflex.dll','sl.pcl.dll','nvngx_dlss.dll','nvngx_dlssd.dll','nvngx_dlssg.dll'
+    'sl.reflex.dll','sl.pcl.dll','nvngx_dlssg.dll'
 )) {
     $loose = Join-Path 'build\bin' $dll
     if (Test-Path $loose) { Remove-Item -Force $loose }
+}
+# NGX Super Resolution loads nvngx_dlss.dll from the exe directory. Frame-gen
+# DLLs and sl.interposer stay only under build/bin/streamline — that interposer
+# faults before wWinMain if it sits beside the MinGW exe.
+foreach ($dll in @('nvngx_dlss.dll','nvngx_dlssd.dll')) {
+    $src = Join-Path $outSl $dll
+    if (Test-Path $src) { Copy-Item -Force $src (Join-Path 'build\bin' $dll) }
 }
 Write-Host 'Built: build\bin\GrassStress.exe'

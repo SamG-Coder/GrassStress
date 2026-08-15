@@ -393,9 +393,7 @@ float3 cosineHemisphere(float3 n,float2 random) {
 float3 directionToSun() { return normalize(g_SunDirection); }
 float3 directionToMoon() { return normalize(g_MoonDirection); }
 bool sunIsKeyLight() {
-    const float3 luminance=float3(.2126,.7152,.0722);
-    return dot(g_SunColor*g_SunIntensity,luminance)>=
-           dot(g_MoonColor*g_MoonIntensity,luminance);
+    return directionToSun().y>0.02&&g_SunIntensity>1e-4;
 }
 float3 directionToKeyLight() {
     return sunIsKeyLight()?directionToSun():directionToMoon();
@@ -760,7 +758,7 @@ float3 skyIrradiance(float3 normal) {
     float3 zenith=lerp(nightZenith,dayZenith,daylight);
     float3 sky=lerp(horizon,zenith,pow(up,.58));
     sky*=lerp(1.0,.38,g_StormIntensity);
-    sky+=g_MoonColor*g_MoonIntensity*(.16+.22*up);
+    sky+=g_MoonColor*g_MoonIntensity*(.55+.70*up);
     sky+=lightningRadiance()*(.12+.16*up);
     return max(sky,0);
 }
@@ -792,8 +790,9 @@ float3 environmentRadiance(float3 direction) {
     float sunDisk=smoothstep(cos(.0058),cos(.0042),sunMu)*g_SunIntensity;
     float sunAureole=pow(sunMu,48)*(.16+.30*g_SunIntensity);
     float moonMu=saturate(dot(d,moon));
-    float moonDisk=smoothstep(cos(.0052),cos(.0040),moonMu)*g_MoonPhase;
-    color+=moonDisk*float3(.42,.52,.82)+pow(moonMu,96)*g_MoonColor*g_MoonIntensity*.8;
+    float moonDisk=smoothstep(cos(.0060),cos(.0036),moonMu)*g_MoonPhase;
+    color+=moonDisk*g_MoonColor*max(g_MoonIntensity,0.15)*6.5+
+           pow(moonMu,48)*g_MoonColor*max(g_MoonIntensity,0.15)*3.2;
 
     float horizonStars=smoothstep(.035,.25,d.y);
     if(g_StarVisibility>.001)
@@ -831,7 +830,18 @@ float3 environmentRadiance(float3 direction) {
     color+=sunDisk*g_SunColor*13.0*cloud.transmission+
            sunAureole*g_SunColor*1.4*lerp(.18,1.0,cloud.transmission);
     color+=lightningRadiance()*(.18+.48*horizonHaze);
-    if(d.y<0)color=lerp(float3(.010,.014,.012),color,saturate(1+d.y*7.0));
+    if(d.y<0){
+        float t=-camera.eye.y/min(d.y,-1e-4);
+        float3 hit=camera.eye+d*max(t,0.0);
+        float2 uv=hit.xz*.08;
+        float4 turf=sampleGroundAlbedo(uv,0u,5.0);
+        float3 albedo=max(turf.rgb,float3(.07,.14,.04));
+        float3 n=float3(0,1,0);
+        float3 lit=albedo*(skyIrradiance(n)*.45+
+            keyLightRadiance()*saturate(dot(n,directionToKeyLight()))*.95);
+        float mixDown=saturate(-d.y*4.0);
+        color=lerp(color,lit,mixDown);
+    }
     return max(color,0);
 }
 
@@ -1107,16 +1117,16 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex) {
     float3 axisZ=normalize(cross(axisX,blade.normal));
     uint patchRandomSeed=patch.seed&0x00ffffffu;
     uint seed=hashUint(patchRandomSeed^((bladeIndex+1u)*0x9e3779b9u));
-    uint baseCandidateCount=min(patch.packed&255u,128u);
+    uint baseCandidateCount=min(patch.packed&255u,160u);
     uint baseTallCount=min((patch.packed>>16)&255u,baseCandidateCount);
     float densityScale=max(clamp(camera.grassSettings.x,0.0,6.0),1.0);
     uint tallCount=min((uint)ceil(baseTallCount*min(densityScale,1.8)),
                        (uint)ceil(baseCandidateCount*densityScale));
     blade.tall=bladeIndex<tallCount?1.0:0.0;
-    float radius=sqrt(randomUint(seed))*lerp(.245,.065,blade.tall);
+    float radius=sqrt(randomUint(seed))*lerp(.22,.12,blade.tall);
     float offsetAngle=randomUint(seed^0x68bc21ebu)*6.2831853;
     float clusterAngle=randomUint(patchRandomSeed^0x91e10da5u)*6.2831853;
-    float clusterRadius=randomUint(patchRandomSeed^0x243f6a88u)*.095*blade.tall;
+    float clusterRadius=randomUint(patchRandomSeed^0x243f6a88u)*.052*blade.tall;
     blade.base=float3((patch.minX+patch.maxX)*.5,patch.baseY,
                       (patch.minZ+patch.maxZ)*.5)
               +axisX*(cos(offsetAngle)*radius+cos(clusterAngle)*clusterRadius)
@@ -1134,7 +1144,7 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex) {
     float maximumHeight=lerp(shortMaximum,tallMaximum,blade.tall);
     blade.height=maximumHeight*lerp(.50,1.0,randomUint(seed^0xa511e9b3u))*
                  clamp(camera.grassSettings.y,.35,2.5);
-    blade.halfWidth=lerp(lerp(.0032,.0068,randomUint(seed^0x63d83595u)),
+    blade.halfWidth=lerp(lerp(.0048,.0095,randomUint(seed^0x63d83595u)),
                          lerp(.0055,.0125,randomUint(seed^0x63d83595u)),blade.tall)
                    *lerp(.88,1.16,patch.moisture);
     float individualPhase=randomUint(seed^0xb5297a4du)*6.2831853;
@@ -1150,10 +1160,12 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex) {
 
 float3 grassWindDirection(BladeData blade) {
     float2 baseDirection=normalize(g_WindDirection);
+    float tunnel=windTunnelMask(blade.base.xz,g_Time,g_WindDirection,g_WindSpeed);
     float2 windUV=blade.base.xz*.05+baseDirection*(g_Time*g_WindSpeed*.20);
     float directionWave=.16*sin(dot(windUV,float2(1.31,-.87))+g_Time*.19);
     float2 rotated=float2(baseDirection.x-directionWave*baseDirection.y,
                           baseDirection.y+directionWave*baseDirection.x);
+    rotated=normalize(rotated+baseDirection*tunnel*1.35);
     float3 wind=normalize(float3(rotated.x,0,rotated.y));
     float3 normal=blade.normal;
     return normalize(wind-normal*dot(wind,normal));
@@ -1167,13 +1179,16 @@ float grassGust(BladeData blade) {
                      dot(blade.base.xz,float2(.23,.17))+blade.phase;
     float gust=.56+.25*sin(traveling)+.14*sin(traveling*2.31+1.7)
               +.05*sin(g_Time*g_WindSpeed*7.2+blade.phase*3.0);
+    float tunnel=windTunnelMask(blade.base.xz,g_Time,g_WindDirection,g_WindSpeed);
+    gust=saturate(gust*lerp(.40,1.62,tunnel)+tunnel*.14);
     return saturate(gust*lerp(.76,1.24,saturate(turbulence)));
 }
 
 float3 bladeCenter(BladeData blade,float along) {
     float s=saturate(along),shape=s*s*(2-s),gust=grassGust(blade);
     float compliance=lerp(.43,.17,blade.stiffness)*lerp(1.0,1.18,blade.tall);
-    float bend=blade.height*g_WindStrength*compliance*gust;
+    float tunnel=windTunnelMask(blade.base.xz,g_Time,g_WindDirection,g_WindSpeed);
+    float bend=blade.height*g_WindStrength*compliance*gust*lerp(.62,1.85,tunnel);
     float flutter=sin(g_Time*g_WindSpeed*(6.5+2.5*(1-blade.stiffness))+blade.phase+s*5.0)
                  *blade.height*.013*g_WindStrength*s*s;
     return blade.base+blade.normal*(blade.height*s)
@@ -1206,63 +1221,43 @@ void GrassIntersection() {
     float3 rayOrigin=ObjectRayOrigin(),rayDirection=ObjectRayDirection();
     uint selection=(patch.seed&0x00ffffffu)^((record.bladeIndex+19u)*0x27d4eb2du);
     float coverageThreshold=randomUint(selection^0x165667b1u);
-    uint segments=1u;
+    float3 p0=bladeCenter(blade,0),p1=bladeCenter(blade,1);
+    float physicalW0=blade.halfWidth+.00015;
+    float physicalW1=blade.halfWidth*pow(max(.015,.015),.72)+.00015;
+    float widthCap=blade.tall>.5?.043:.018;
+    float renderW0=min(max(physicalW0,targetHalfWidth),widthCap);
+    float renderW1=min(max(physicalW1,targetHalfWidth),widthCap);
     uint planeCount=visibilityRay?1u:2u;
-    uint selectedPlane=0;
-    if(visibilityRay){
-        float3 mid=bladeCenter(blade,.5);
-        float3 tangent=normalize(bladeCenter(blade,.75)-bladeCenter(blade,.25));
-        float facing0=abs(dot(normalize(cross(blade.side,tangent)),rayDirection));
-        float facing1=abs(dot(normalize(cross(blade.crossSide,tangent)),rayDirection));
-        selectedPlane=facing1>facing0?1u:0u;
-    }
-    [loop] for(uint segment=0;segment<segments;++segment) {
-        float s0=float(segment)/segments,s1=float(segment+1u)/segments;
-        float3 p0=bladeCenter(blade,s0),p1=bladeCenter(blade,s1);
-        float physicalW0=blade.halfWidth*pow(max(1-s0,.015),.72)+.00015;
-        float physicalW1=blade.halfWidth*pow(max(1-s1,.015),.72)+.00015;
-        float widthCap=blade.tall>.5?.043:.018;
-        float renderW0=min(max(physicalW0,targetHalfWidth),widthCap);
-        float renderW1=min(max(physicalW1,targetHalfWidth),widthCap);
-        [loop] for(uint planeStep=0;planeStep<planeCount;++planeStep){
-            uint planeIndex=visibilityRay?selectedPlane:planeStep;
-            float3 ribbonSide=planeIndex==0u?blade.side:blade.crossSide;
-            float3 left0=p0-ribbonSide*renderW0,right0=p0+ribbonSide*renderW0;
-            float3 left1=p1-ribbonSide*renderW1,right1=p1+ribbonSide*renderW1;
-            float2 triangleBary;float candidateT=bestT;
-            if(rayTriangle(rayOrigin,rayDirection,left0,right0,left1,RayTMin(),candidateT,
-                           triangleBary)){
-                float across=triangleBary.x;
-                float along=lerp(s0,s1,triangleBary.y);
-                float local=saturate((along-s0)*segments);
-                float coverage=saturate(lerp(physicalW0,physicalW1,local)/
-                                        max(lerp(renderW0,renderW1,local),1e-5));
-                if(coverageThreshold<coverage){
-                    bestT=candidateT;
-                    bestAttribute.encoded=float2(float(record.bladeIndex)+.10+.80*across,
-                                                 along+2.0*planeIndex);
-                    found=true;
-                }
-            }
-            candidateT=bestT;
-            if(rayTriangle(rayOrigin,rayDirection,right0,right1,left1,RayTMin(),candidateT,
-                           triangleBary)){
-                float across=1-triangleBary.y;
-                float along=s0*(1-triangleBary.x-triangleBary.y)+s1*(triangleBary.x+triangleBary.y);
-                float local=saturate((along-s0)*segments);
-                float coverage=saturate(lerp(physicalW0,physicalW1,local)/
-                                        max(lerp(renderW0,renderW1,local),1e-5));
-                if(coverageThreshold<coverage){
-                    bestT=candidateT;
-                    bestAttribute.encoded=float2(float(record.bladeIndex)+.10+.80*across,
-                                                 along+2.0*planeIndex);
-                    found=true;
-                }
+    [loop] for(uint planeStep=0;planeStep<planeCount;++planeStep){
+        float3 ribbonSide=planeStep==0u?blade.side:blade.crossSide;
+        float3 left0=p0-ribbonSide*renderW0,right0=p0+ribbonSide*renderW0;
+        float3 left1=p1-ribbonSide*renderW1,right1=p1+ribbonSide*renderW1;
+        float2 triangleBary;float candidateT=bestT;
+        if(rayTriangle(rayOrigin,rayDirection,left0,right0,left1,RayTMin(),candidateT,triangleBary)){
+            float along=saturate(triangleBary.y);
+            float coverage=saturate(lerp(physicalW0,physicalW1,along)/max(lerp(renderW0,renderW1,along),1e-5));
+            if(coverageThreshold<coverage){
+                bestT=candidateT;
+                bestAttribute.encoded=float2(float(record.bladeIndex)+.10+.80*triangleBary.x,
+                                             along+2.0*planeStep);
+                found=true;
             }
         }
-        if(found&&visibilityRay&&ReportHit(bestT,0,bestAttribute))return;
+        candidateT=bestT;
+        if(rayTriangle(rayOrigin,rayDirection,right0,right1,left1,RayTMin(),candidateT,triangleBary)){
+            float along=saturate(triangleBary.x+triangleBary.y);
+            float coverage=saturate(lerp(physicalW0,physicalW1,along)/max(lerp(renderW0,renderW1,along),1e-5));
+            if(coverageThreshold<coverage){
+                bestT=candidateT;
+                bestAttribute.encoded=float2(float(record.bladeIndex)+.10+.80*(1-triangleBary.y),
+                                             along+2.0*planeStep);
+                found=true;
+            }
+        }
+        if(found&&visibilityRay)break;
     }
-    if(found)ReportHit(bestT,0,bestAttribute);
+    if(found&&bestT>RayTMin()&&bestT<RayTCurrent())
+        ReportHit(bestT,0,bestAttribute);
 }
 
 [shader("closesthit")]
@@ -1284,19 +1279,21 @@ void GrassRadianceHit(inout RadiancePayload payload,in GrassAttributes attr) {
                                     patch.colourLushColony*.08);
     float dryThreshold=lerp(.82,.94,patch.moisture);
     float dry=smoothstep(dryThreshold-.03,dryThreshold+.03,clusteredDryness);
-    float3 green=lerp(float3(.040,.068,.014),float3(.095,.155,.030),
+    float3 green=lerp(float3(.058,.122,.032),float3(.125,.205,.048),
                       saturate(.28+.55*patch.moisture));
-    green*=1.0+patch.colourWarmCool*float3(.035,.006,-.045);
-    green*=lerp(float3(.86,.93,.83),float3(1.10,1.08,.91),patch.colourFertility);
-    green=lerp(green,green*float3(1.10,1.01,.76),patch.colourDryColony*.22);
-    green*=lerp(.72,1.04,smoothstep(0,.70,along));
+    green*=1.0+patch.colourWarmCool*float3(.025,.008,-.028);
+    green*=lerp(float3(.94,.98,.90),float3(1.10,1.08,.96),patch.colourFertility);
+    green=lerp(green,green*float3(1.06,1.02,.86),patch.colourDryColony*.12);
+    green*=lerp(.88,1.08,smoothstep(0,.70,along));
     float3 straw=float3(.145,.122,.042)*lerp(.82,1.06,along)*
                   lerp(.90,1.10,patch.colourDryColony);
-    float3 albedo=lerp(green,straw,dry);
+    float3 albedo=lerp(green,straw,dry*.40);
     float wetness=saturate(g_WetnessFactor*.78);
     albedo*=lerp(1.0,.61,wetness);
     if(payload.depth==0){payload.worldNormal=n;payload.roughness=lerp(.50,.16,wetness);payload.diffuseAlbedo=albedo;payload.specular=lerp(.025,.08,wetness);}
-    float3 sun=directionToKeyLight();float3 keyRadiance=keyLightRadiance();
+    float3 sun=directionToSun();
+    float3 moon=directionToMoon();
+    float3 shadowDir=directionToKeyLight();
     uint2 pixel=DispatchRaysIndex().xy;
     uint expId=experimentId(camera.sceneSettings.y);
     float2 random=expUsesR2(expId)?
@@ -1304,41 +1301,43 @@ void GrassRadianceHit(inout RadiancePayload payload,in GrassAttributes attr) {
                   float2(hash(pixel),hash(pixel.yx))):
         float2(hash(pixel+camera.frameIndex*131),
                hash(pixel.yx+camera.frameIndex*173));
-    float3 sunTangent=normalize(cross(abs(sun.y)<.9?float3(0,1,0):float3(1,0,0),sun));
-    float3 sunBitangent=cross(sun,sunTangent);float angle=random.y*6.2831853;
-    sun=normalize(sun+sunTangent*cos(angle)*sqrt(random.x)*.0065
+    float3 sunTangent=normalize(cross(abs(shadowDir.y)<.9?float3(0,1,0):float3(1,0,0),shadowDir));
+    float3 sunBitangent=cross(shadowDir,sunTangent);float angle=random.y*6.2831853;
+    shadowDir=normalize(shadowDir+sunTangent*cos(angle)*sqrt(random.x)*.0065
                      +sunBitangent*sin(angle)*sqrt(random.x)*.0065);
-    VisibilityPayload shadow;shadow.visible=0;RayDesc ray;ray.Origin=hit+n*.004;
-    ray.Direction=sun;ray.TMin=.003;ray.TMax=1000;
-    TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
-             0x1,1,0,1,ray,shadow);
     float cloudTransmission=cloudKeyTransmittance(hit);
-    float keyVisibility=float(shadow.visible)*cloudTransmission;
-    if(payload.depth==0)payload.primaryKeyVisibility=keyVisibility;
-    float frontLight=saturate(dot(n,sun)),backLight=saturate(dot(-n,sun));
-    float3 fiberDirect=0;
-    if(expUsesFiber(expId)){
-        float3 viewF=normalize(camera.eye-hit);
-        fiberDirect=keyRadiance*fiberScatter(tangent,n,viewF,sun,albedo,wetness);
-        frontLight=0;backLight=0;
+    float keyVisibility=cloudTransmission;
+    if(payload.depth==0){
+        VisibilityPayload shadow;shadow.visible=0;RayDesc ray;ray.Origin=hit+n*.004;
+        ray.Direction=shadowDir;ray.TMin=.003;ray.TMax=20;
+        TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+                 0x1,1,0,1,ray,shadow);
+        keyVisibility=float(shadow.visible)*cloudTransmission;
     }
-    float3 ambient=skyIrradiance(n)*(.62+.20*along);
-    float cloudShade=1-cloudTransmission;
-    ambient=ambient*lerp(1.0,1.10,cloudShade)+
-            float3(.014,.022,.034)*daylightAmount()*cloudShade;
-    float3 direct=keyRadiance*frontLight*keyVisibility*1.42;
-    float3 unmodulated=keyRadiance*float3(.42,.74,.20)*backLight*
-                       keyVisibility*.72;
-    float3 view=normalize(camera.eye-hit),halfVector=normalize(sun+view);
-    float wetExponent=lerp(22.0,110.0,wetness);
-    unmodulated+=keyRadiance*pow(saturate(dot(n,halfVector)),wetExponent)*
-                 lerp(.08,.34,wetness)*keyVisibility;
-    ambient+=lightningRadiance()*(.18+.10*along);
-    float seedHead=blade.tall*smoothstep(.70,.79,along)*(1-smoothstep(.92,1.0,along))
-                   *step(.84,clusteredDryness);
-    albedo=lerp(albedo,float3(.30,.27,.10),seedHead*.46);
-    float fade=lerp(.58,1.0,smoothstep(0,.22,along));
-    float3 result=(albedo*(ambient+direct)+unmodulated+fiberDirect*keyVisibility)*fade;
+    if(payload.depth==0)payload.primaryKeyVisibility=keyVisibility;
+    float3 view=normalize(camera.eye-hit);
+    float sunWeight=saturate(sun.y*8.0)*step(1e-4,g_SunIntensity);
+    float moonWeight=saturate(moon.y*8.0)*saturate(g_MoonIntensity*3.0);
+    float3 ambient=albedo*skyIrradiance(n)*.20;
+    float3 result=ambient;
+    if(sunWeight>0){
+        float wrap=abs(dot(n,sun))*.65+.35;
+        float backLight=saturate(-dot(n,sun));
+        float3 fiber=fiberScatter(tangent,n,view,sun,albedo,.18);
+        float3 halfVector=normalize(sun+view);
+        float3 spec=pow(saturate(abs(dot(n,halfVector))),48.0)*.42;
+        result+=(g_SunColor*g_SunIntensity)*(fiber*wrap+albedo*backLight*.90+spec)*
+                keyVisibility*sunWeight*1.85;
+    }
+    if(moonWeight>0){
+        float wrap=abs(dot(n,moon))*.65+.35;
+        float3 fiber=fiberScatter(tangent,n,view,moon,albedo,.10);
+        float3 halfVector=normalize(moon+view);
+        float3 spec=pow(saturate(abs(dot(n,halfVector))),36.0)*.28;
+        result+=(g_MoonColor*g_MoonIntensity)*(fiber*wrap+spec)*moonWeight*2.4;
+    }
+    float fade=lerp(.88,1.0,smoothstep(0,.18,along));
+    result*=fade;
     if(payload.depth==0){
         RadiancePayload bounce;bounce.color=0;bounce.depth=1;
         bounce.primaryT=SceneRayMaximum;bounce.primaryKeyVisibility=1;clearGbufferFields(bounce);
@@ -2033,7 +2032,7 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     }
 
     float3 baseSun=directionToKeyLight(),sunTangent=normalize(cross(abs(baseSun.y)<.9?float3(0,1,0):float3(1,0,0),baseSun)),sunBitangent=cross(baseSun,sunTangent);float diskRadius=sqrt(random.x)*.0065,angle=random.y*6.2831853;float3 sunDir=normalize(baseSun+sunTangent*cos(angle)*diskRadius+sunBitangent*sin(angle)*diskRadius);
-    VisibilityPayload shadow;shadow.visible=0;RayDesc s;s.Origin=hit+(thinFoliage?sunDir:surfaceNormal)*.012;s.Direction=sunDir;s.TMin=.01;s.TMax=SceneRayMaximum;TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0x3,1,0,1,s,shadow);
+    VisibilityPayload shadow;shadow.visible=0;RayDesc s;s.Origin=hit+(thinFoliage?sunDir:surfaceNormal)*.012;s.Direction=sunDir;s.TMin=.01;s.TMax=24;TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0x1,1,0,1,s,shadow);
     float cloudTransmission=cloudKeyTransmittance(hit);
     float visibility=float(shadow.visible)*cloudTransmission;
     if(payload.depth==0)payload.primaryKeyVisibility=visibility;
@@ -2042,7 +2041,7 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     // converges on static frames; terrain cavity/normal maps provide the local
     // ground occlusion without another traversal.
     bool terrainSurface=(kind>1.5&&kind<2.5)||generatedWorldTerrain||riverSurface;
-    VisibilityPayload ao;ao.visible=1;if(payload.depth==0&&!terrainSurface){ao.visible=0;RayDesc ar;ar.Origin=hit+surfaceNormal*.015;ar.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*47),hash(pixel.yx+camera.frameIndex*71)));ar.TMin=.01;ar.TMax=1.35;TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0x1,1,0,1,ar,ao);}
+    VisibilityPayload ao;ao.visible=1;
     float3 keyRadiance=keyLightRadiance();
     float ndl=saturate(dot(n,sunDir));float occlusion=lerp(.76,1.0,float(ao.visible));if(camera.sceneSettings.x>.5&&terrainSurface&&!riverSurface)occlusion*=lerp(.24,.72,visibility);float3 ambient=skyIrradiance(n)*(.48+.16*saturate(n.y))*occlusion;float cloudShade=1-cloudTransmission;ambient=ambient*lerp(1.0,1.10,cloudShade)+float3(.014,.022,.034)*daylightAmount()*cloudShade;ambient+=lerp(float3(.010,.014,.020),float3(.20,.17,.12),daylightAmount())*(.08+.14*saturate(-n.y));ambient+=lightningRadiance()*(.16+.14*saturate(n.y));float3 direct=keyRadiance*ndl*visibility*1.28;float3 unmodulated=0;
     // Restrict the additional traversal to visible primary surfaces inside
@@ -2267,7 +2266,18 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         }
         result=lerp(result,reflection.color,reflectionWeight);
     }
-    if(payload.depth==0&&!terrainSurface){RadiancePayload bounce;bounce.color=0;bounce.depth=1;bounce.primaryT=6;bounce.primaryKeyVisibility=1;clearGbufferFields(bounce);RayDesc br;br.Origin=hit+surfaceNormal*.018;br.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*89),hash(pixel.yx+camera.frameIndex*113)));br.TMin=.01;br.TMax=3.2;TraceRay(Scene,RAY_FLAG_NONE,0x3,0,0,0,br,bounce);result+=albedo*bounce.color*.075;}
+    if(payload.depth==0&&!terrainSurface){
+        RadiancePayload bounce;bounce.color=0;bounce.depth=1;
+        bounce.primaryT=6;bounce.primaryKeyVisibility=1;clearGbufferFields(bounce);
+        RayDesc br;br.Origin=hit+surfaceNormal*.018;
+        br.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*89),
+                                             hash(pixel.yx+camera.frameIndex*113)));
+        br.TMin=.01;br.TMax=1.8;
+        // Must run closest-hit on mask 0x3. SKIP_CLOSEST + procedural grass
+        // removes the device after a few frames on this driver.
+        TraceRay(Scene,RAY_FLAG_NONE,0x3,0,0,0,br,bounce);
+        result+=albedo*bounce.color*.075;
+    }
     // The streamed near scene is surrounded by a finite 16 km LOD shell.
     // At grazing angles its last few heightfield cells would otherwise retain
     // enough saturated land colour to reveal the square mesh boundary as

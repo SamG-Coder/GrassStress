@@ -34,6 +34,19 @@ bool expUsesRestir(uint e) { return e == EXP_RESTIR || e == EXP_STACK; }
 bool expUsesPsf(uint e) { return e == EXP_PSF || e == EXP_STACK; }
 bool expUsesCascades(uint e) { return e == EXP_CASCADES || e == EXP_STACK; }
 
+// Traveling wind wave: a rolling front of bend that sweeps the meadow.
+float windTunnelMask(float2 xz, float time, float2 windDir, float windSpeed) {
+    float2 dir = dot(windDir, windDir) > 1e-6 ? normalize(windDir) : float2(0, 1);
+    float2 perp = float2(-dir.y, dir.x);
+    float along = dot(xz, dir);
+    float across = dot(xz, perp);
+    float speed = max(windSpeed, 0.45);
+    float front = sin(along * 0.38 - time * speed * 1.28);
+    float swell = sin(along * 0.16 - time * speed * 0.58 + 0.85);
+    float rip = 0.16 * sin(across * 0.48 + time * 0.33);
+    return saturate(0.30 + 0.48 * front + 0.22 * swell + rip);
+}
+
 // Roberts, "The Unreasonable Effectiveness of Quasirandom Sequences" (2018).
 // Plastic constant g = 1.32471795724474602596; R2 is the 2-D Kronecker sequence.
 float2 r2Sequence(uint n) {

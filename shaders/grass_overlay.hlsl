@@ -69,9 +69,7 @@ float3 directionToMoon() {
 }
 
 bool sunIsKeyLight() {
-    const float3 luminance=float3(.2126,.7152,.0722);
-    return dot(g_SunColor*g_SunIntensity,luminance)>=
-           dot(g_MoonColor*g_MoonIntensity,luminance);
+    return directionToSun().y>0.02&&g_SunIntensity>1e-4;
 }
 
 float3 directionToKeyLight() {
@@ -131,16 +129,17 @@ float playerLocalLightVisibility(float3 hit,float3 direction,float distanceToLig
     RayDesc ray;ray.Origin=hit+direction*.012;ray.Direction=direction;
     ray.TMin=.003;ray.TMax=max(distanceToLight-.025,.004);
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_FORCE_OPAQUE> query;
-    query.TraceRayInline(Scene,RAY_FLAG_NONE,0x3,ray);
+    query.TraceRayInline(Scene,RAY_FLAG_NONE,0x1,ray);
     while(query.Proceed()){}
     return query.CommittedStatus()==COMMITTED_NOTHING?1:0;
 }
 
 float pathTracedSunVisibility(float3 hit,float3 normal,float3 sunDir) {
     RayDesc ray;ray.Origin=hit+normal*.008;ray.Direction=sunDir;
-    ray.TMin=.004;ray.TMax=36.0;
+    ray.TMin=.004;ray.TMax=20.0;
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_FORCE_OPAQUE> query;
-    query.TraceRayInline(Scene,RAY_FLAG_NONE,0x3,ray);
+    // Terrain/trees only. Blade-to-blade sun is a 10M-AABB walk for no look.
+    query.TraceRayInline(Scene,RAY_FLAG_NONE,0x1,ray);
     while(query.Proceed()){}
     return query.CommittedStatus()==COMMITTED_NOTHING?1:0;
 }
@@ -171,7 +170,7 @@ float3 pathTracedBounce(float3 hit,float3 normal,float3 albedo,uint seed) {
         float2(randomUint(seed),randomUint(seed^0x9e3779b9u));
     RayDesc ray;ray.Origin=hit+normal*.010;
     ray.Direction=cosineHemisphere(normal,u);
-    ray.TMin=.006;ray.TMax=2.2;
+    ray.TMin=.006;ray.TMax=1.6;
     RayQuery<RAY_FLAG_FORCE_OPAQUE> query;
     query.TraceRayInline(Scene,RAY_FLAG_NONE,0x3,ray);
     while(query.Proceed()){}
@@ -189,6 +188,12 @@ float3 clearSkyAirlight(float3 direction) {
     float3 airlight=lerp(horizon,zenith,pow(up,.58))*lerp(1.0,.52,g_StormIntensity);
     float forwardScatter=pow(saturate(dot(d,directionToKeyLight())),12);
     airlight+=keyLightRadiance()*forwardScatter*.22+lightningRadiance()*.20;
+    if(d.y<0){
+        float3 turf=float3(.08,.16,.045);
+        float3 lit=turf*(skyIrradiance(float3(0,1,0))*.45+
+            keyLightRadiance()*saturate(directionToKeyLight().y)*.95);
+        airlight=lerp(airlight,lit,saturate(-d.y*4.0));
+    }
     return max(airlight,0);
 }
 
@@ -256,13 +261,13 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex,float3 patchNormal,
     // The retained far-resident population is distributed through the patch
     // like the short blades.  Keeping it in tight central clumps made every
     // lawn patch read as a tuft of long meadow grass.
-    float radius=sqrt(randomUint(seed))*lerp(.265,.205,blade.tall);
+    float radius=sqrt(randomUint(seed))*lerp(.22,.14,blade.tall);
     float offsetAngle=randomUint(seed^0x68bc21ebu)*6.2831853;
     uint subclump=bladeIndex%3u;
     float clusterAngle=randomUint(patchRandomSeed^0x91e10da5u)*6.2831853+
                        float(subclump)*2.0943951+
                        (randomUint(seed^0x243f6a88u)-.5)*.34;
-    float clusterRadius=lerp(.018,.045,
+    float clusterRadius=lerp(.010,.026,
         randomUint(patchRandomSeed^(subclump*0x9e3779b9u)))*blade.tall;
     blade.base=float3((patch.minX+patch.maxX)*.5,patch.baseY,
                       (patch.minZ+patch.maxZ)*.5)
@@ -288,8 +293,8 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex,float3 patchNormal,
     blade.height*=lerp(1.0,.52,dryClipping);
     float widthVariation=randomUint(seed^0x63d83595u);
     float mediumBlade=max(blade.tall,step(.86,blade.species));
-    float fineWidth=lerp(.0004,.0010,widthVariation);
-    float mediumWidth=lerp(.0010,.0020,widthVariation);
+    float fineWidth=lerp(.0018,.0036,widthVariation);
+    float mediumWidth=lerp(.0034,.0062,widthVariation);
     blade.halfWidth=lerp(fineWidth,mediumWidth,mediumBlade)*
                     lerp(.92,1.10,patch.moisture);
     float individualPhase=randomUint(seed^0xb5297a4du)*6.2831853;
@@ -321,11 +326,13 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex,float3 patchNormal,
 
 float3 grassWindDirection(BladeData blade) {
     float2 baseDirection=normalize(g_WindDirection);
+    float tunnel=windTunnelMask(blade.base.xz,g_Time,g_WindDirection,g_WindSpeed);
     float2 windUV=blade.base.xz*.05+baseDirection*(g_Time*g_WindSpeed*.20);
     float directionWave=.16*sin(dot(windUV,float2(1.31,-.87))+
                                 g_Time*.19*saturate(g_WindSpeed));
     float2 rotated=float2(baseDirection.x-directionWave*baseDirection.y,
                           baseDirection.y+directionWave*baseDirection.x);
+    rotated=normalize(rotated+baseDirection*tunnel*1.35);
     float3 wind=normalize(float3(rotated.x,0,rotated.y));
     float3 normal=blade.normal;
     return normalize(wind-normal*dot(wind,normal));
@@ -339,6 +346,8 @@ float grassGust(BladeData blade) {
                      dot(blade.base.xz,float2(.23,.17))+blade.phase;
     float gust=.56+.25*sin(traveling)+.14*sin(traveling*2.31+1.7)
               +.05*sin(g_Time*g_WindSpeed*7.2+blade.phase*3.0);
+    float tunnel=windTunnelMask(blade.base.xz,g_Time,g_WindDirection,g_WindSpeed);
+    gust=saturate(gust*lerp(.40,1.62,tunnel)+tunnel*.14);
     return saturate(gust*lerp(.76,1.24,saturate(turbulence)));
 }
 
@@ -405,9 +414,12 @@ BladeMotion prepareBladeMotionAt(BladeData blade,float time) {
         gust=saturate(raw*lerp(.76,1.24,saturate(turbulence)));
     }
     (void)savedTime;
-    motion.bend=blade.height*g_WindStrength*compliance*gust*waterPinning;
+    float tunnel=windTunnelMask(blade.base.xz,time,g_WindDirection,g_WindSpeed);
+    motion.bend=blade.height*g_WindStrength*compliance*gust*waterPinning*
+                lerp(.62,1.85,tunnel);
     motion.flutterPhase=time*g_WindSpeed*(6.5+2.5*(1-blade.stiffness))+blade.phase;
-    motion.flutterAmplitude=blade.height*.013*g_WindStrength*waterPinning;
+    motion.flutterAmplitude=blade.height*.013*g_WindStrength*waterPinning*
+                            lerp(.70,2.15,tunnel);
     float interactionResponse;
     motion.interactionDirection=grassInteractionDirection(blade,interactionResponse);
     float contactCompliance=lerp(1.10,.82,blade.stiffness)*lerp(.88,1.08,blade.tall);
@@ -494,49 +506,19 @@ VSOutput inactiveVertex() {
 }
 
 VSOutput VSMain(uint vertexId : SV_VertexID,uint instanceId : SV_InstanceID) {
-    uint instanceStride=clamp(drawInstanceStride,1u,128u);
+    uint instanceStride=clamp(drawInstanceStride,1u,160u);
     uint patchIndex=drawPatchOffset+instanceId/instanceStride;
     uint bladeIndex=instanceId%instanceStride;
     GrassPatch patch=GrassPatches[patchIndex];
-    uint baseCandidateCount=min(patch.packed&255u,128u);
+    uint baseCandidateCount=min(patch.packed&255u,160u);
     uint baseTallCount=min((patch.packed>>16)&255u,baseCandidateCount);
     float densityScale=clamp(camera.grassSettings.x,0.0,6.0);
-    uint candidateCount=min((uint)ceil(baseCandidateCount*densityScale),128u);
+    uint candidateCount=min((uint)ceil(baseCandidateCount*densityScale),160u);
     uint tallCount=min((uint)ceil(baseTallCount*min(densityScale,1.8)),candidateCount);
-    float shortDistance=clamp(camera.grassSettings.z,2.0,128.0);
-    float tallDistance=max(shortDistance,clamp(camera.grassSettings.w,4.0,192.0));
-    // Short grass must not switch as one camera-centred ring.  A broad
-    // transition gives each world-stable blade room to leave independently as
-    // the player moves, instead of removing a whole band behind the camera and
-    // introducing the matching band in front.
-    float shortTransitionDistance=min(tallDistance,
-        max(shortDistance+12.0,shortDistance*1.45));
-    float3 patchCenter=float3((patch.minX+patch.maxX)*.5,patch.baseY,
-                              (patch.minZ+patch.maxZ)*.5);
-    float patchDistance=distance(camera.eye,patchCenter);
-    if(patchDistance>=tallDistance||
-       (tallCount==0u&&patchDistance>=shortTransitionDistance))
-        return inactiveVertex();
-
     if(bladeIndex>=candidateCount)return inactiveVertex();
     bool tallBlade=bladeIndex<tallCount;
     uint selection=(patch.seed&0x00ffffffu)^((bladeIndex+19u)*0x27d4eb2du);
-    // Give every blade a deterministic exit radius derived only from its
-    // absolute patch/blade identity.  The population remains anchored in world
-    // space while the fade shell travels past it.
-    float shortSpan=max(shortTransitionDistance-shortDistance,.01);
-    float shortExit=lerp(shortDistance,shortTransitionDistance,
-                         randomUint(selection^0x68bc21ebu));
-    float shortFadeWidth=min(shortSpan,max(1.5,shortSpan*.30));
-    if(!tallBlade&&patchDistance>=shortExit)return inactiveVertex();
-    float shortCoverage=1-smoothstep(shortExit-shortFadeWidth,shortExit,
-                                     patchDistance);
-    float tallCoverage=1-smoothstep(tallDistance*.70,tallDistance,patchDistance);
-    float distanceCoverage=tallBlade?tallCoverage:shortCoverage;
-    float tallLodDensity=lerp(.62,1.0,1-smoothstep(3.0,tallDistance,patchDistance));
-    if(distanceCoverage<=0||
-       (tallBlade&&bladeIndex>=2u&&randomUint(selection)>tallLodDensity))
-        return inactiveVertex();
+    float distanceCoverage=1.0;
 
     float3 patchNormal=normalize(float3(patch.normalX,
         sqrt(saturate(1-patch.normalX*patch.normalX-patch.normalZ*patch.normalZ)),
@@ -570,7 +552,7 @@ VSOutput VSMain(uint vertexId : SV_VertexID,uint instanceId : SV_InstanceID) {
     float pixelScale=2*camera.tanHalfFov/max(1.0,(float)camera.resolution.y);
     float minimumHalfWidth0=.22*viewDepth0*pixelScale;
     float minimumHalfWidth1=.22*viewDepth1*pixelScale;
-    float widthCap=blade.tall>.5?.028:.012;
+    float widthCap=blade.tall>.5?.055:.032;
     float renderWidth0=min(max(physicalWidth0,minimumHalfWidth0),widthCap);
     float renderWidth1=min(max(physicalWidth1,minimumHalfWidth1),widthCap);
 
@@ -644,20 +626,20 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float bladeTone=float((input.ditherSeed>>8)&255u)*(1.0/255.0);
     float vitality=saturate(.22+.48*moisture+.18*fertile+.10*lushColony-
                             .10*dryColony+(bladeTone-.5)*.18);
-    float3 green=lerp(float3(.034,.068,.028),float3(.073,.126,.046),vitality);
-    green*=1.0+warmCool*float3(.040,.008,-.035);
-    green*=lerp(float3(.92,.95,.90),float3(1.06,1.04,.95),fertile);
+    float3 green=lerp(float3(.055,.118,.038),float3(.110,.198,.062),vitality);
+    green*=1.0+warmCool*float3(.028,.010,-.025);
+    green*=lerp(float3(.96,.99,.94),float3(1.08,1.06,.98),fertile);
     float olive=smoothstep(.56,.94,bladeTone+dryColony*.16-lushColony*.10);
-    green=lerp(green,float3(.091,.101,.039),olive*.38);
-    green*=lerp(.86,1.03,smoothstep(0,.72,along));
+    green=lerp(green,float3(.102,.148,.048),olive*.22);
+    green*=lerp(.92,1.08,smoothstep(0,.72,along));
     float3 straw=float3(.137,.113,.061)*lerp(.90,1.04,along)*
                   lerp(.94,1.08,dryColony);
-    float3 albedo=lerp(green,straw,dry*.84);
+    float3 albedo=lerp(green,straw,dry*.42);
     float yellowTip=smoothstep(.66,.91,dryness)*
                     smoothstep(.58,.97,along)*(1-dry*.58);
-    albedo=lerp(albedo,float3(.126,.124,.052),yellowTip*.46);
+    albedo=lerp(albedo,float3(.126,.124,.052),yellowTip*.22);
     float albedoLuminance=dot(albedo,float3(.2126,.7152,.0722));
-    albedo=lerp(albedoLuminance.xxx,albedo,.72);
+    albedo=lerp(albedoLuminance.xxx,albedo,.92);
     // Puddles weigh down the blade and soak its lower stem.  The tip keeps the
     // atmospheric wetness only, so flattened grass still has readable green
     // detail above the thin water film.
@@ -665,62 +647,36 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float submergedStem=smoothstep(.003,.025,waterlineAlong)*
         (1-smoothstep(waterlineAlong-waterlineWidth,
                       waterlineAlong+waterlineWidth,along));
-    float wetness=max(saturate(g_WetnessFactor*.78),submergedStem);
-    albedo*=lerp(1.0,.61,wetness);
-    albedo*=lerp(1.0,.78,submergedStem);
+    float wetness=max(saturate(g_WetnessFactor*.35),submergedStem*.4);
+    albedo*=lerp(1.0,.86,submergedStem);
     float3 view=normalize(camera.eye-input.worldPosition);
     float3 n=normalize(input.normal);
-    if(dot(n,view)<0)n=-n;
-    float3 sun=directionToKeyLight();
-    float3 keyRadiance=keyLightRadiance();
-    // DXR stores the primary surface's actual key-light visibility in alpha.
-    // Inferring it from display luminance double-shadowed grass over the tree
-    // shadow and incorrectly treated dark bark/soil as occlusion.
-    float sunVisibility=SceneColor.Load(int3(int2(pixel),0)).a;
-    float3 bounce=0;
-    // Budget rays by distance. Near blades still get per-blade sun + bounce;
-    // mid is checkerboarded; far reuses the already path-traced key visibility.
-    uint rayGate=input.ditherSeed^((uint)pixel.x+((uint)pixel.y<<10)+camera.frameIndex*17u);
-    if(grassViewDepth<11.0||(grassViewDepth<24.0&&(rayGate&1u)==0u))
-        sunVisibility=pathTracedSunVisibility(input.worldPosition,n,sun);
-    if(grassViewDepth<9.0||(grassViewDepth<18.0&&(rayGate&3u)==0u))
-        bounce=pathTracedBounce(input.worldPosition,n,albedo,rayGate);
-    else
-        bounce=albedo*skyIrradiance(n)*.28;
-    uint expId=experimentId(camera.sceneSettings.y);
+    float3 sun=directionToSun();
+    float3 moon=directionToMoon();
+    float sunWeight=saturate(sun.y*8.0)*step(1e-4,g_SunIntensity);
+    float moonWeight=saturate(moon.y*8.0)*saturate(g_MoonIntensity*3.0);
+    float sunVisibility=sunWeight>0?SceneColor.Load(int3(int2(pixel),0)).a:1.0;
     float3 fiberT=normalize(float3(-n.x*n.y,max(1-n.y*n.y,.05),-n.z*n.y));
-    float frontLight=saturate(dot(n,sun));
-    float backLight=saturate(dot(-n,sun));
-    float3 ambient=.5*(skyIrradiance(n)+skyIrradiance(-n))*(.78+.16*along);
-    ambient+=keyRadiance*float3(.034,.042,.024)*(.42+.62*sunVisibility);
-    float3 direct=keyRadiance*frontLight*sunVisibility*1.32;
-    if(expUsesFiber(expId)){
-        float3 fiber=fiberScatter(fiberT,n,view,sun,albedo,wetness);
-        direct=keyRadiance*fiber*sunVisibility*1.05;
-        backLight=0;
+    float3 ambient=albedo*skyIrradiance(n)*.22;
+    float3 result=ambient;
+    if(sunWeight>0){
+        float wrap=abs(dot(n,sun))*.65+.35;
+        float backLight=saturate(-dot(n,sun));
+        float3 fiber=fiberScatter(fiberT,n,view,sun,albedo,.18);
+        float3 halfVector=normalize(sun+view);
+        float3 spec=pow(saturate(abs(dot(n,halfVector))),48.0)*.42;
+        result+=(g_SunColor*g_SunIntensity)*(fiber*wrap+albedo*backLight*.95+spec)*
+                sunVisibility*sunWeight*1.85;
     }
-    // Coverage and scene-depth rejection have already run, so inline rays are
-    // issued only for surviving grass fragments inside the local-light range.
-    // The raster blades themselves are intentionally not in the
-    // TLAS; this tests tree, terrain, and environment occlusion without costly
-    // blade-to-blade shadowing.
-    LocalLightSample localLight=samplePlayerLocalLight(input.worldPosition);
-    float localNdotL=localLight.active*saturate(dot(n,localLight.direction));
-    if(localNdotL>1e-4){
-        float localVisibility=playerLocalLightVisibility(
-            input.worldPosition,localLight.direction,localLight.distance);
-        direct+=localLight.radiance*localNdotL*localVisibility*.68;
+    if(moonWeight>0){
+        float wrap=abs(dot(n,moon))*.65+.35;
+        float3 fiber=fiberScatter(fiberT,n,view,moon,albedo,.10);
+        float3 halfVector=normalize(moon+view);
+        float3 spec=pow(saturate(abs(dot(n,halfVector))),36.0)*.28;
+        result+=(g_MoonColor*g_MoonIntensity)*(fiber*wrap+spec)*moonWeight*2.4;
     }
-    float3 transmittedTint=lerp(albedo,float3(.080,.108,.045),.26);
-    float3 unmodulated=keyRadiance*transmittedTint*backLight*
-                        sunVisibility*.40;
-    float3 halfVector=normalize(sun+view);
-    float wetExponent=lerp(22.0,110.0,wetness);
-    unmodulated+=keyRadiance*pow(saturate(dot(n,halfVector)),wetExponent)*
-                 lerp(.025,.13,wetness)*sunVisibility;
-    ambient+=lightningRadiance()*(.18+.10*along);
-    float fade=lerp(.82,1.0,smoothstep(0,.22,along));
-    float3 result=(albedo*(ambient+direct)+unmodulated+bounce)*fade;
+    float fade=lerp(.88,1.0,smoothstep(0,.18,along));
+    result*=fade;
     float3 rayDirection=normalize(input.worldPosition-camera.eye);
     result=applyAerialPerspective(result,input.worldPosition,rayDirection);
     if(camera.waterState.x>.5){

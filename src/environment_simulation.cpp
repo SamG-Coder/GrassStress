@@ -218,8 +218,11 @@ const EnvironmentCB& EnvironmentSimulation::update(float deltaTimeSeconds) {
         {1.0f,0.30f,0.05f},{1.0f,0.95f,0.85f},middayBlend);
 
     const float moonPhase=saturate(finiteOr(controls.moonPhase,0.75f));
-    const EnvironmentFloat3 moonDirection={-sunDirection.x,-sunDirection.y,
-                                            -sunDirection.z};
+    const float moonSpin=0.42f;
+    const EnvironmentFloat3 moonDirection=normalized({
+        -sunDirection.x*std::cos(moonSpin)+sunDirection.z*std::sin(moonSpin),
+        -sunDirection.y,
+        -sunDirection.x*std::sin(moonSpin)-sunDirection.z*std::cos(moonSpin)});
     // Moonlight begins only once the sun is visibly below the horizon. This
     // keeps sunset directional shadows from flipping to the opposite sky at
     // the geometric horizon while preserving a smooth astronomical twilight.

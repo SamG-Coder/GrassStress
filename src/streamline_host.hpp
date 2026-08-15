@@ -83,6 +83,8 @@ public:
     void markerPresentEnd();
 
     void setCamera(const CameraBasis& current, const CameraBasis& previous, bool reset);
+    // Create NGX DLSS on a dedicated command list. Never do this mid-frame.
+    bool ensureFeature(ID3D12GraphicsCommandList* commands);
     bool evaluateUpscale(ID3D12GraphicsCommandList* commands,
                          ID3D12Resource* hdrColor,
                          ID3D12Resource* linearDepth,
@@ -117,7 +119,7 @@ private:
     Impl* impl_{};
     StreamlineStatus status_{};
     DlssQuality requestedQuality_ = DlssQuality::Quality;
-    FrameGenMode requestedFrameGen_ = FrameGenMode::Dynamic;
+    FrameGenMode requestedFrameGen_ = FrameGenMode::Off;
 };
 
 void copyHaltonJitter(std::uint32_t index, float* outX, float* outY);
